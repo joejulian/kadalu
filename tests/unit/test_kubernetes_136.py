@@ -113,6 +113,42 @@ def test_fork_images_default_to_ghcr_namespace():
         )
 
 
+def test_kubernetes_development_tools_use_fork_image_defaults():
+    minikube_script = (ROOT / "tests/minikube.sh").read_text(encoding="utf-8")
+    assert (
+        'KADALU_BUILD_IMAGE_REPO=${KADALU_BUILD_IMAGE_REPO:-"joejulian"}'
+        in minikube_script
+    )
+    assert (
+        'KADALU_IMAGE_REPO=${KADALU_IMAGE_REPO:-"ghcr.io/joejulian"}'
+        in minikube_script
+    )
+    assert (
+        'copy_image_to_cluster "${KADALU_BUILD_IMAGE_REPO}/kadalu-operator:'
+        '${KADALU_VERSION}" "${KADALU_IMAGE_REPO}/kadalu-operator:'
+        '${KADALU_VERSION}"'
+        in minikube_script
+    )
+
+    run_local = (ROOT / "extras/scripts/run-local").read_text(encoding="utf-8")
+    assert 'DOCKER_USER="${DOCKER_USER:-joejulian}"' in run_local
+    assert 'IMAGES_HUB="${IMAGES_HUB:-ghcr.io}"' in run_local
+    for image in ("kadalu-server", "kadalu-operator", "kadalu-csi"):
+        assert (
+            f'docker tag "${{DOCKER_USER}}/{image}:${{TAG}}" '
+            f'"${{IMAGES_HUB}}/${{DOCKER_USER}}/{image}:${{TAG}}"'
+            in run_local
+        )
+
+    for job_file in ("controller.nomad", "nodeplugin.nomad"):
+        nomad_job = (ROOT / "nomad" / job_file).read_text(encoding="utf-8")
+        assert 'default = "devel"' in nomad_job.replace("     =", " =")
+        assert (
+            'image = "ghcr.io/joejulian/kadalu-csi:'
+            '${var.kadalu_version}"' in nomad_job
+        )
+
+
 def test_current_multi_arch_csi_sidecars_are_digest_pinned():
     documents = _render_csi_documents()
     containers = {

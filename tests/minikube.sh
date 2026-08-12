@@ -391,7 +391,8 @@ COMMIT_MSG=${COMMIT_MSG:-""}
 MEMORY=${MEMORY:-"3000"}
 VM_DRIVER=${VM_DRIVER:-"none"}
 # configure image repo
-KADALU_IMAGE_REPO=${KADALU_IMAGE_REPO:-"docker.io/kadalu"}
+KADALU_BUILD_IMAGE_REPO=${KADALU_BUILD_IMAGE_REPO:-"joejulian"}
+KADALU_IMAGE_REPO=${KADALU_IMAGE_REPO:-"ghcr.io/joejulian"}
 K8S_IMAGE_REPO=${K8S_IMAGE_REPO:-"quay.io/k8scsi"}
 
 # feature-gates for kube
@@ -448,7 +449,7 @@ case "${1:-}" in
     ;;
   copy-image)
     echo "copying the kadalu-operator image"
-    copy_image_to_cluster kadalu/kadalu-operator:${KADALU_VERSION} "${KADALU_IMAGE_REPO}"/kadalu-operator:${KADALU_VERSION}
+    copy_image_to_cluster "${KADALU_BUILD_IMAGE_REPO}/kadalu-operator:${KADALU_VERSION}" "${KADALU_IMAGE_REPO}/kadalu-operator:${KADALU_VERSION}"
     ;;
   ssh)
     echo "connecting to minikube"

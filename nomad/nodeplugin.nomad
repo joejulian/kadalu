@@ -16,7 +16,7 @@ variable "gluster_volname" {
 }
 
 variable "kadalu_version" {
-  default = "1.1.0"
+  default = "devel"
 }
 
 job "kadalu-csi-nodeplugin" {
@@ -72,7 +72,7 @@ job "kadalu-csi-nodeplugin" {
       }
 
       config {
-        image = "docker.io/kadalu/kadalu-csi:${var.kadalu_version}"
+        image = "ghcr.io/joejulian/kadalu-csi:${var.kadalu_version}"
 
         privileged = true
 

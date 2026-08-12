@@ -1,8 +1,11 @@
 #!/bin/bash
 
-TAG="local"
+TAG="${TAG:-local}"
+DOCKER_USER="${DOCKER_USER:-joejulian}"
+IMAGES_HUB="${IMAGES_HUB:-ghcr.io}"
 
-export KADALU_VERSION=$TAG
+export DOCKER_USER IMAGES_HUB
+export KADALU_VERSION="${TAG}"
 
 # Build everything required from latest changes
 
@@ -10,9 +13,9 @@ make build-containers
 make gen-manifest
 
 # This makes the docker start to check image here first
-docker tag kadalu/kadalu-server:$TAG docker.io/kadalu/kadalu-server:$TAG
-docker tag kadalu/kadalu-operator:$TAG docker.io/kadalu/kadalu-operator:$TAG
-docker tag kadalu/kadalu-csi:$TAG docker.io/kadalu/kadalu-csi:$TAG
+docker tag "${DOCKER_USER}/kadalu-server:${TAG}" "${IMAGES_HUB}/${DOCKER_USER}/kadalu-server:${TAG}"
+docker tag "${DOCKER_USER}/kadalu-operator:${TAG}" "${IMAGES_HUB}/${DOCKER_USER}/kadalu-operator:${TAG}"
+docker tag "${DOCKER_USER}/kadalu-csi:${TAG}" "${IMAGES_HUB}/${DOCKER_USER}/kadalu-csi:${TAG}"
 
 # Change this to pick the local image
 sed -i -e 's/Always/IfNotPresent/g' manifests/kadalu-operator.yaml
