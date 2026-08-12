@@ -1,136 +1,167 @@
-name: "On Pull Request"
+name: Pull Request
 
 on:
   pull_request:
     branches:
       - devel
-    paths-ignore:
-      - 'doc/**'
-      - 'extras/**'
-      - '!extras/Dockerfile.builder'
-      - '**.md'
 
-# Skip based on commit msg is inbuilt into Github Runner
-# Visit: https://github.blog/changelog/2021-02-08-github-actions-skip-pull-request-and-push-workflows-with-skip-ci/
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-request-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
 
 jobs:
-  # Primarily used to save info required for any jobs/steps
-  get-info:
-    name: Save required info
-    runs-on: ubuntu-latest
-    outputs:
-      files: ${{ steps.files.outputs.out }}
-      msg: ${{ steps.msg.outputs.out }}
-      build_base: ${{ steps.build_base.outputs.out }}
+  python-quality:
+    name: Python 3.12 unit, lint, and generated-code checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - id: files
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements/ci_merge-requirements.txt
+            requirements/ci_submit-requirements.txt
+
+      - name: Install native build dependencies
         run: |
-          URL="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files"
-          FILES=$(curl -s -X GET -G $URL | jq -r '.[] | .filename')
-          echo ::set-output name=out::$FILES
-      - id: msg
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential libattr1-dev
+
+      - name: Install locked dependencies
         run: |
-          URL="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits"
-          MSG=$(curl -s -X GET -G $URL | jq -r '.[] | .commit.message')
-          echo ::set-output name=out::$MSG
-      - id: build_base
+          python -m pip install --requirement requirements/ci_merge-requirements.txt
+          python -m pip install --requirement requirements/ci_submit-requirements.txt
+          python -m pip install --no-deps --editable ./requirements
+          python -m pip check
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit cli/kubectl_kadalu
+
+      - name: Run Python quality checks
+        run: |
+          make pylint
+          make build-grpc
+          git diff --exit-code -- csi/csi_pb2.py csi/csi_pb2_grpc.py
+
+  manifests:
+    name: Helm and Kubernetes 1.36 manifest checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tests/ci/renderer-requirements.txt
+
+      - name: Install locked renderer dependencies
+        run: python -m pip install --requirement tests/ci/renderer-requirements.txt
+
+      - name: Install pinned Kubernetes tools
+        run: tests/ci/install-kubernetes-tools.sh
+
+      - name: Validate chart and rendered manifests
+        run: |
+          tests/ci/render-manifests.sh
+          make gen-manifest
+          git diff --exit-code -- manifests
+
+  kubernetes-1-36:
+    name: Kubernetes 1.36 kind API compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tests/ci/renderer-requirements.txt
+
+      - name: Install locked renderer dependencies
+        run: python -m pip install --requirement tests/ci/renderer-requirements.txt
+
+      - name: Install pinned Kubernetes tools
+        run: tests/ci/install-kubernetes-tools.sh
+
+      - name: Run Kubernetes 1.36 API smoke test
+        run: tests/kind/kubernetes-1.36-api-smoke.sh
+
+  image-build:
+    name: Build amd64 runtime and CSI test images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements/ci_merge-requirements.txt
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential libattr1-dev
+
+      - name: Build kubectl-kadalu
         env:
-          FILES: ${{ steps.files.outputs.out }}
+          KADALU_VERSION: ci
         run: |
-          BUILD_BASE="no"
-          # build base image if one of below conditions is met
-          # 1. if we have only CHANGELOG.md update (basically getting ready for a release)
-          if grep -e 'CHANGELOG.md' <<< "$b" && [ $(wc -w <<< "$b") == 1 ]; then
-            BUILD_BASE="yes"
-          # 2. if builder dockerfile is edited
-          elif grep -e 'extras/Dockerfile.builder' <<< "$FILES"; then
-            BUILD_BASE="yes"
-          fi
-          echo ::set-output name=out::$BUILD_BASE
+          python -m pip install --requirement requirements/ci_merge-requirements.txt
+          python -m pip install --no-deps --editable ./requirements
+          make cli-build
 
-  pylint:
-    name: Run pylint
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v2
-    - name: Set up Python
-      uses: actions/setup-python@v1
-      with:
-        python-version: '3.10'
+      - name: Derive reproducible image metadata
+        run: |
+          echo "IMAGE_BUILDDATE=$(git show --no-patch --format=%cI "${GITHUB_SHA}")" \
+            >>"${GITHUB_ENV}"
 
-    - uses: actions/cache@v2
-      with:
-        path: ${{ env.pythonLocation }}
-        key: ${{ env.pythonLocation }}-${{ hashFiles('requirements/ci_submit-requirements.txt') }}-${{ hashFiles('requirements/ci_merge-requirements.txt') }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
-    - name: Install dependencies pylint
-      run: |
-          python -m pip install --upgrade --upgrade-strategy eager -r requirements/ci_submit-requirements.txt -r requirements/ci_merge-requirements.txt -e ./requirements
+      - name: Build pinned builder, runtime, and CSI test images
+        env:
+          IMAGE_REPOSITORY: kadalu-ci
+          IMAGE_REVISION: ${{ github.sha }}
+          IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          IMAGE_TAG: test
+          KADALU_VERSION: ${{ github.sha }}
+        run: docker buildx bake ci-images
 
-    - name: Run pylint
-      run: make pylint
+      - name: Verify CSI sanity version
+        run: |
+          test "$(docker run --rm --entrypoint /usr/local/sbin/csi-sanity \
+            kadalu-ci/test-csi:test --version)" = "Version = v5.5.0"
 
-  run-on-minikube:
-    name: kube 1.22.0
-    runs-on: ubuntu-latest
-    needs: get-info
-    env:
-      KUBE_VERSION: v1.22.0
-      # No script currently uses COMMIT_MSG
-      COMMIT_MSG: ${{needs.get-info.outputs.msg}}
-      FILES: ${{needs.get-info.outputs.files}}
-      BUILD_BASE: ${{needs.get-info.outputs.build_base}}
-    steps:
-    - uses: actions/checkout@v2
-    - name: Install Docker Dependencies
-      run: sudo apt-get install -y conntrack ruby
-    # CLI Tests
-    - name: Install Binnacle and build kubectl-kadalu
-      run: |
-        # Temporary until https://github.com/kadalu/binnacle/issues/44
-        curl -L https://github.com/kadalu/binnacle/releases/download/0.6.1/binnacle -o binnacle
-        chmod +x ./binnacle
-        sudo mv ./binnacle /usr/local/bin/binnacle
-        binnacle --version
-        make cli-build
-    - name: kubectl-kadalu Tests
-      run: binnacle -v cli/tests/storage_add.t
-    # Build Containers
-    - name: Build locally
-      id: build_local
-      run: |
-        BUILD_BASE="$BUILD_BASE" make build-containers;
+      - name: Install pinned Kubernetes tools
+        run: tests/ci/install-kubernetes-tools.sh
 
-        # Conditionally build test containers if PR includes tests/**/Dockerfile
-        CONTAINERS_FOR=''
-        if grep -e '\btests.*Dockerfile\b' <<< "$FILES"; then
-          CONTAINERS_FOR=TESTING
-        fi
-        # In build script, only test containers will be built if this variable is set
-        if [[ "$CONTAINERS_FOR" == "TESTING" ]]; then
-          CONTAINERS_FOR=TESTING make test-containers
-        fi
-        echo Completed building containers
-    - name: Generate Manifests
-      run: VERBOSE="yes" make gen-manifest
-
-    # Operator Tests
-    - name: Setup Minikube
-      run: tests/setup.sh $KUBE_VERSION
-    - name: Run tests
-      run: tests/travis-test.sh $KUBE_VERSION
-    - name: Cleanup
-      run: tests/cleanup.sh $KUBE_VERSION
-
-    # CLI Tests (run conditionally)
-    - name: Setup Minikube (CLI Test)
-      run: |
-        sudo sysctl fs.protected_regular=0
-        tests/setup.sh $KUBE_VERSION
-      if: "contains(needs.get-info.outputs.files, 'cli')"
-    - name: Run tests (CLI Test)
-      run: tests/travis-test.sh $KUBE_VERSION cli
-      if: "contains(needs.get-info.outputs.files, 'cli')"
-    - name: Cleanup (CLI Test)
-      run: tests/cleanup.sh $KUBE_VERSION
-      if: "contains(needs.get-info.outputs.files, 'cli')"
+      - name: Run Kubernetes 1.36 storage lifecycle
+        env:
+          IMAGE_REPOSITORY: kadalu-ci
+          IMAGE_TAG: test
+        run: tests/kind/kubernetes-1.36-storage-smoke.sh

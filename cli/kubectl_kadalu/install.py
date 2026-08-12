@@ -162,9 +162,15 @@ def run(args):
         insttype = ""
 
         if args.version and args.version == "devel":
-            file_url = "https://raw.githubusercontent.com/kadalu/kadalu/devel/manifests"
+            file_url = (
+                "https://raw.githubusercontent.com/joejulian/kadalu/"
+                "devel/manifests"
+            )
         elif args.version:
-            file_url = "https://github.com/kadalu/kadalu/releases/download/%s" % args.version
+            file_url = (
+                "https://github.com/joejulian/kadalu/releases/download/%s"
+                % args.version
+            )
 
         if args.type and args.type != "kubernetes":
             insttype = "-%s" % args.type

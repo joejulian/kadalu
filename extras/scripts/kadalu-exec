@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+import json
+import os
 import subprocess
 from argparse import ArgumentParser
 
@@ -6,18 +8,34 @@ parser = ArgumentParser()
 parser.add_argument("podprefix", help="Pod prefix")
 parser.add_argument("-c", help="Container name")
 parser.add_argument("-n", help="Node name")
+parser.add_argument(
+    "--namespace",
+    default=os.environ.get("KADALU_NAMESPACE", "kadalu"),
+    help="Kadalu namespace (default: KADALU_NAMESPACE or kadalu)",
+)
 
 args = parser.parse_args()
 
-cmd = 'kubectl get pods -nkadalu -o wide | grep "%s-"' % args.podprefix
-if args.n:
-   cmd += ' | grep "%s"' % args.n
+pods_output = subprocess.run(
+    ["kubectl", "get", "pods", "-n", args.namespace, "-o", "json"],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+pods = json.loads(pods_output.stdout).get("items", [])
+matches = [
+    pod
+    for pod in pods
+    if pod["metadata"]["name"].startswith(f"{args.podprefix}-")
+    and (not args.n or pod.get("spec", {}).get("nodeName") == args.n)
+]
+if not matches:
+    parser.error("no matching pod found")
 
-out = subprocess.check_output(cmd, shell=True)
-parts = out.split()
-cmd_exec = 'kubectl -nkadalu exec -it %s' % parts[0].decode()
+pod_name = min(pod["metadata"]["name"] for pod in matches)
+cmd_exec = ["kubectl", "exec", "-it", "-n", args.namespace, pod_name]
 if args.c:
-   cmd_exec += " -c %s" % args.c
+    cmd_exec.extend(["-c", args.c])
 
-cmd_exec += " /bin/bash"
-subprocess.run(cmd_exec, shell=True)
+cmd_exec.extend(["--", "/bin/bash"])
+subprocess.run(cmd_exec, check=False)

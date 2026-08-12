@@ -19,6 +19,8 @@ from prometheus_client import make_asgi_app
 from utils import CommandError, execute
 
 metrics_app = FastAPI()
+NAMESPACE = os.environ.get("KADALU_NAMESPACE", "kadalu")
+KUBECTL_CMD = os.environ.get("KUBECTL_CMD", "/usr/bin/kubectl")
 
 class Metrics:
     """ Metrics class with Kadalu Components """
@@ -32,8 +34,10 @@ class Metrics:
 def get_pod_data():
     """ Get pod and container info of all Pods in kadalu namespace """
 
-    cmd = ["kubectl", "get", "pods", "-l", "app.kubernetes.io/part-of=kadalu",
-            "--field-selector=status.phase==Running", "-nkadalu", "-ojson"]
+    cmd = [KUBECTL_CMD, "get", "pods", "-l",
+           "app.kubernetes.io/part-of=kadalu",
+           "--field-selector=status.phase==Running",
+           "-n", NAMESPACE, "-ojson"]
 
     try:
         resp = execute(cmd)
@@ -43,6 +47,7 @@ def get_pod_data():
             command=cmd,
             error=err
         ))
+        return {}
 
     data = json.loads(resp.stdout)
     pod_data = {}
@@ -97,7 +102,8 @@ def get_storage_config_data():
     related data from configmap for all volumes
     """
 
-    cmd = ["kubectl", "get", "configmap", "kadalu-info", "-nkadalu", "-ojson"]
+    cmd = [KUBECTL_CMD, "get", "configmap", "kadalu-info",
+           "-n", NAMESPACE, "-ojson"]
 
     storage_config_data = {}
     try:
@@ -166,6 +172,8 @@ def set_default_values(metrics):
             })
 
     storage_config_data = get_storage_config_data()
+    if storage_config_data is None:
+        return
     pools = storage_config_data["list_of_storages"]
     storage_type_data = storage_config_data["storage_type_data"]
     brick_data = storage_config_data["brick_data"]

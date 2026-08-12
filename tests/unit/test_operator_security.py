@@ -2,9 +2,15 @@
 
 import os
 import subprocess
+import sys
+import types
+from pathlib import Path
 
 import pytest
 import yaml
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _operator_deployment():
@@ -73,6 +79,16 @@ def test_rendered_manifests_are_separate_from_templates(tmp_path, monkeypatch):
 
     # Imports are intentionally local so the manifest-only test above does not
     # require the operator's runtime dependencies.
+    monkeypatch.syspath_prepend(str(ROOT / "cli" / "kubectl_kadalu"))
+    fake_kadalulib = types.ModuleType("kadalulib")
+    fake_kadalulib.CommandException = RuntimeError
+    fake_kadalulib.execute = lambda *args, **kwargs: None
+    fake_kadalulib.get_single_pv_per_pool = lambda spec: False
+    fake_kadalulib.is_host_reachable = lambda host, port: True
+    fake_kadalulib.logf = lambda message, **kwargs: message
+    fake_kadalulib.logging_setup = lambda: None
+    fake_kadalulib.send_analytics_tracker = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "kadalulib", fake_kadalulib)
     from kadalu_operator import main
 
     monkeypatch.setattr(main, "TEMPLATES_DIR", os.fspath(templates_dir))

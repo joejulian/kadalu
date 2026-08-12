@@ -1,0 +1,3 @@
+# Minimal pins mirrored from requirements/ci_merge-requirements.txt.
+jinja2==3.1.6
+markupsafe==3.0.3

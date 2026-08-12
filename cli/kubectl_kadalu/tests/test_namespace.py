@@ -341,6 +341,45 @@ def test_install_checks_and_applies_to_selected_namespace(monkeypatch, tmp_path)
     assert not rendered_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("version", "expected_url"),
+    [
+        (
+            "devel",
+            "https://raw.githubusercontent.com/joejulian/kadalu/"
+            "devel/manifests/kadalu-operator.yaml",
+        ),
+        (
+            "heist-test",
+            "https://github.com/joejulian/kadalu/releases/download/"
+            "heist-test/kadalu-operator.yaml",
+        ),
+    ],
+)
+def test_install_downloads_this_forks_manifests(
+        monkeypatch, version, expected_url):
+    calls = []
+    requested_urls = []
+    replies = iter([response(""), response("configured\n")])
+
+    def execute(command):
+        calls.append(command)
+        return next(replies)
+
+    monkeypatch.setattr(utils, "execute", execute)
+    monkeypatch.setattr(
+        install,
+        "read_operator_manifest",
+        lambda url: requested_urls.append(url) or (
+            "kind: Namespace\napiVersion: v1\nmetadata:\n  name: kadalu\n"
+        ),
+    )
+    install.run(args(local_yaml=None, version=version, type="kubernetes"))
+
+    assert requested_urls == [expected_url]
+    assert calls[1][-1].startswith("/tmp/kadalu-operator-")
+
+
 def test_cli_sources_do_not_hardcode_kadalu_namespace():
     source_dir = Path(__file__).resolve().parents[1]
     for source in source_dir.glob("*.py"):

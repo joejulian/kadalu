@@ -5,7 +5,7 @@
 Download the latest release with the command
 
 ```
-curl -LO https://github.com/kadalu/kadalu/releases/download/0.8.0/kubectl-kadalu
+curl -LO https://github.com/joejulian/kadalu/releases/latest/download/kubectl-kadalu
 ```
 
 Make the kubectl binary executable.

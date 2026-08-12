@@ -3,12 +3,15 @@
 # Declare variables to be passed into your templates.
 
 global:
+  # Empty uses the packaged chart version; source-tree renders use "devel".
+  kadaluVersion: ''
   image:
     registry: 'docker.io'
-    repository: 'kadalu'
+    repository: 'joejulian'
     pullPolicy: 'IfNotPresent'
   kubeletDir: ''
   kubernetesDistro: 'kubernetes'
+  csiSidecarRegistry: 'registry.k8s.io'
 
 # Values while deploying operator
 operator:

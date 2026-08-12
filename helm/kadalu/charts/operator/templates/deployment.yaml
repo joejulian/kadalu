@@ -53,6 +53,8 @@ spec:
               value: {{ .Values.global.image.registry | quote }}
             - name: DOCKER_USER
               value: {{ .Values.global.image.repository | quote }}
+            - name: CSI_SIDECAR_REGISTRY
+              value: {{ .Values.global.csiSidecarRegistry | quote }}
             - name: KADALU_VERSION
               value: {{ include "common.version" . | quote }}
             - name: KADALU_NAMESPACE

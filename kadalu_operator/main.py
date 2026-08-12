@@ -26,6 +26,9 @@ NAMESPACE = os.environ.get("KADALU_NAMESPACE", "kadalu")
 VERSION = os.environ.get("KADALU_VERSION", "latest")
 K8S_DIST = os.environ.get("K8S_DIST", "kubernetes")
 IMAGES_HUB = os.environ.get("IMAGES_HUB", "docker.io")
+CSI_SIDECAR_REGISTRY = os.environ.get(
+    "CSI_SIDECAR_REGISTRY", "registry.k8s.io"
+)
 KUBELET_DIR = os.environ.get("KUBELET_DIR")
 VERBOSE = os.environ.get("VERBOSE", "no")
 TEMPLATES_DIR = os.environ.get("KADALU_TEMPLATES_DIR", "/kadalu/templates")
@@ -444,7 +447,7 @@ def deploy_server_pods(obj):
     voltype = obj["spec"]["type"]
     pv_reclaim_policy = obj["spec"].get("pvReclaimPolicy", "delete")
     tolerations = obj["spec"].get("tolerations")
-    docker_user = os.environ.get("DOCKER_USER", "kadalu")
+    docker_user = os.environ.get("DOCKER_USER", "joejulian")
 
     shd_required = False
     if voltype in (VOLUME_TYPE_REPLICA_3, VOLUME_TYPE_REPLICA_2,
@@ -673,6 +676,13 @@ def handle_deleted(core_v1_client, obj):
 
     logging.info(logf("Delete requested", volname=volname))
 
+    if storage_info_data is None:
+        logging.error(logf(
+            "Storage delete failed. Storage metadata is unavailable",
+            storage=volname,
+        ))
+        return
+
     pv_count = get_num_pvs(storage_info_data)
 
     if pv_count == -1:
@@ -715,7 +725,8 @@ def get_configmap_data(volname):
     Get storage info data from kadalu configmap
     """
 
-    cmd = ["kubectl", "get", "configmap", "kadalu-info", "-nkadalu", "-ojson"]
+    cmd = [KUBECTL_CMD, "get", "configmap", "kadalu-info",
+           "-n", NAMESPACE, "-ojson"]
 
     try:
         resp = utils_execute(cmd)
@@ -773,7 +784,7 @@ def delete_server_pods(storage_info_data, obj):
     voltype = storage_info_data['type']
     volumeid = storage_info_data['volume_id']
 
-    docker_user = os.environ.get("DOCKER_USER", "kadalu")
+    docker_user = os.environ.get("DOCKER_USER", "joejulian")
 
     shd_required = False
     if voltype in (VOLUME_TYPE_REPLICA_3, VOLUME_TYPE_REPLICA_2):
@@ -858,36 +869,18 @@ def delete_storage_class(hostvol_name, _):
     ))
 
 
-def csi_driver_object_api_version():
-    """
-    Return API Version of CSI Driver object"
-    """
-
-    cmd = ["kubectl", "get", "csidriver", "kadalu", "-ojson"]
-
-    try:
-        resp = utils_execute(cmd)
-        csi_driver_data = json.loads(resp.stdout)
-        version = csi_driver_data["apiVersion"]
-        return version[version.rfind("/")+1:]
-
-    except CommandError as err:
-        logging.error(logf(
-            "Failed to get version of csi driver object",
-            error=err
-        ))
-        return None
-
-
 def watch_stream(core_v1_client, k8s_client):
     """
     Watches kubernetes event stream for kadalustorages in Kadalu namespace
     """
     crds = client.CustomObjectsApi(k8s_client)
     k8s_watch = watch.Watch()
-    initial_list = crds.list_cluster_custom_object("kadalu-operator.storage",
-                                                   "v1alpha1",
-                                                   "kadalustorages")
+    initial_list = crds.list_namespaced_custom_object(
+        "kadalu-operator.storage",
+        "v1alpha1",
+        NAMESPACE,
+        "kadalustorages",
+    )
 
     for item in initial_list.get("items"):
         handle_added(core_v1_client, item)
@@ -895,9 +888,10 @@ def watch_stream(core_v1_client, k8s_client):
     metadata = initial_list.get("metadata")
     resource_version = metadata['resourceVersion']
 
-    for event in k8s_watch.stream(crds.list_cluster_custom_object,
+    for event in k8s_watch.stream(crds.list_namespaced_custom_object,
                                   "kadalu-operator.storage",
                                   "v1alpha1",
+                                  NAMESPACE,
                                   "kadalustorages",
                                   resource_version=resource_version):
         obj = event["object"]
@@ -944,36 +938,18 @@ def deploy_csi_pods(core_v1_client):
         if pod.metadata.name.startswith(CSI_POD_PREFIX):
             logging.info("Updating already deployed CSI pods")
 
-    # Deploy CSI Pods
-    api_instance = client.VersionApi().get_code()
-
-    if api_instance.major > "1" or api_instance.major == "1" and \
-       api_instance.minor >= "22":
-
-        csi_driver_version = csi_driver_object_api_version()
-        if csi_driver_version is not None and \
-           csi_driver_version != "v1":
-            lib_execute(KUBECTL_CMD, DELETE_CMD, "csidriver", "kadalu")
-            logging.info(logf(
-                "Deleted existing CSI Driver object",
-                csi_driver_version=csi_driver_version
-            ))
-
-        filename = os.path.join(MANIFESTS_DIR, "csi-driver-object-v1.yaml")
-        template(filename, namespace=NAMESPACE, kadalu_version=VERSION)
-        lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
-
-    elif api_instance.major > "1" or api_instance.major == "1" and \
-       api_instance.minor >= "14":
-        filename = os.path.join(MANIFESTS_DIR, "csi-driver-object.yaml")
-        template(filename, namespace=NAMESPACE, kadalu_version=VERSION)
-        lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
+    # storage.k8s.io/v1 has been served since Kubernetes 1.18 and is the only
+    # CSIDriver API available on the supported Kubernetes 1.36 baseline.
+    filename = os.path.join(MANIFESTS_DIR, "csi-driver-object-v1.yaml")
+    template(filename, namespace=NAMESPACE, kadalu_version=VERSION)
+    lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
 
     filename = os.path.join(MANIFESTS_DIR, "csi.yaml")
-    docker_user = os.environ.get("DOCKER_USER", "kadalu")
+    docker_user = os.environ.get("DOCKER_USER", "joejulian")
     template(filename, namespace=NAMESPACE, kadalu_version=VERSION,
              docker_user=docker_user, k8s_dist=K8S_DIST,
              images_hub=IMAGES_HUB,
+             csi_sidecar_registry=CSI_SIDECAR_REGISTRY,
              kubelet_dir=KUBELET_DIR, verbose=VERBOSE,)
 
     lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
@@ -1047,7 +1023,8 @@ def add_tolerations(resource, name, tolerations):
         return
     patch = {"spec": {"template": {"spec": {"tolerations": tolerations}}}}
     try:
-        lib_execute(KUBECTL_CMD, PATCH_CMD, resource, name, "-p", json.dumps(patch), "--type=merge")
+        lib_execute(KUBECTL_CMD, PATCH_CMD, resource, name, "-n", NAMESPACE,
+                    "-p", json.dumps(patch), "--type=merge")
     except CommandException as err:
         errmsg = f"Unable to patch {resource}/{name} with tolerations \
         {str(tolerations)}"

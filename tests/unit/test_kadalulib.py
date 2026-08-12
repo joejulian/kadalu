@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from lib.kadalulib import is_server_pod_reachable
+from lib.kadalulib import is_host_reachable, is_server_pod_reachable
 
 
 def _listening_socket(address):
@@ -66,6 +66,19 @@ def test_reachability_supports_ipv6():
 
     try:
         assert is_server_pod_reachable(["::1"], port=port, timeout=1)
+    finally:
+        listener.close()
+        accept_thread.join(timeout=1)
+
+
+def test_external_host_reachability_tries_host_after_connection_failure():
+    listener = _listening_socket((socket.AF_INET, ("127.0.0.1", 0)))
+    port = listener.getsockname()[1]
+    accept_thread = threading.Thread(target=_accept_once, args=(listener,))
+    accept_thread.start()
+
+    try:
+        assert is_host_reachable(["127.0.0.2", "127.0.0.1"], port)
     finally:
         listener.close()
         accept_thread.join(timeout=1)

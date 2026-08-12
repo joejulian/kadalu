@@ -2,19 +2,30 @@
 
 [![Operator Docker Pulls](https://img.shields.io/docker/pulls/kadalu/kadalu-operator.svg?label=DockerPulls%20Operator)](https://img.shields.io/docker/pulls/kadalu/kadalu-operator.svg)
 [![Server Docker Pulls](https://img.shields.io/docker/pulls/kadalu/kadalu-server.svg?label=DockerPulls%20Server)](https://img.shields.io/docker/pulls/kadalu/kadalu-server.svg)
-![Devel](https://github.com/kadalu/kadalu/actions/workflows/on-pr-merge.yml/badge.svg)
-![Release](https://github.com/kadalu/kadalu/actions/workflows/on-release-tag.yml/badge.svg)
+![Devel](https://github.com/joejulian/kadalu/actions/workflows/on-pr-merge.yml/badge.svg)
+![Release](https://github.com/joejulian/kadalu/actions/workflows/on-release-tag.yml/badge.svg)
 
 ## What is Kadalu ?
 
 [Kadalu](https://kadalu.io) is a project to provide Persistent Storage in container ecosystem (like kubernetes, openshift, RKE, etc etc). Kadalu operator deploys CSI pods, and **gluster storage** pods as per the config. You would get your PVs served through APIs implemented in CSI.
+
+## Kubernetes compatibility
+
+This fork supports [Kubernetes 1.36](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/)
+and uses Kubernetes 1.36 as its current compatibility-validation target. Older
+Kubernetes releases may still work, but they are not covered by the current
+validation gate.
+
+Source development and test tooling use Python 3.12 as the baseline. Runtime
+and development dependencies are installed from the locked requirement files
+under [`requirements/`](requirements/).
 
 ## Get Started
 
 Getting started is made easy to copy paste the below commands.
 
 ```console
-curl -fsSL https://github.com/kadalu/kadalu/releases/latest/download/install.sh | sudo bash -x
+curl -fsSL https://github.com/joejulian/kadalu/releases/latest/download/install.sh | sudo bash -x
 kubectl-kadalu version
 kubectl kadalu install --type=$K8S_DIST
 ```
@@ -33,10 +44,14 @@ $ kubectl kadalu storage-add storage-pool-1 --device kube1:/dev/sdc
 
 Note that, in above command, `kube1` is the node which is providing `/dev/sdc` as a storage to kadalu. In your setup, this may be different.
 
-If you made some errors in setup, and want to start fresh, check this [cleanup script](extras/scripts/cleanup), and run it to remove kadalu namespace completely.
+If you made some errors in setup and want to start fresh, check the
+[cleanup script](extras/scripts/cleanup). It removes only Kadalu-labelled or
+explicitly named resources and preserves the namespace by default. Set
+`KADALU_DELETE_NAMESPACE=true` only when the namespace is dedicated to Kadalu
+and should also be removed.
 
 ```
-curl -s https://raw.githubusercontent.com/kadalu/kadalu/devel/extras/scripts/cleanup | bash
+curl -s https://raw.githubusercontent.com/joejulian/kadalu/devel/extras/scripts/cleanup | bash
 ```
 
 
@@ -55,7 +70,7 @@ If you are interested in financial donation to the project, or to the developers
 
 ## Helm support
 
-`helm install kadalu --namespace kadalu --create-namespace https://github.com/kadalu/kadalu/releases/latest/download/kadalu-helm-chart.tgz --set-string kubernetesDistro=$K8S_DIST`
+`helm install kadalu --namespace kadalu --create-namespace https://github.com/joejulian/kadalu/releases/latest/download/kadalu-helm-chart.tgz --set-string global.kubernetesDistro=$K8S_DIST --set operator.enabled=true`
 
 Where `K8S_DIST` can be one of below values:
 - kubernetes
@@ -63,15 +78,15 @@ Where `K8S_DIST` can be one of below values:
 - rke
 - microk8s
 
-If `--set-string` isn't supplied `kubernetes` will be used as default.
+If `global.kubernetesDistro` is not supplied, `kubernetes` is used by default.
 
 NOTE: We are still evolving with Helm chart based development, and happy to get contributions on the same.
 
 ## Platform supports
 
-We support x86_64 (amd64) by default (all releases, `devel` and `latest` tags), and from release 0.8.3 tag arm64 and arm/v7 is supported.
+The fork publishes and verifies multi-architecture images for x86_64 (amd64) and 64-bit ARM (arm64), including 64-bit Raspberry Pi operating systems. The current release pipeline does not publish 32-bit arm/v7 images.
 
-For any other platforms, we need users to confirm it works by building images locally. Once it works, we can include it in our automated scripts. You can confirm the build by command `make release` after checkout of the repository in the respective platform.
+For any other platforms, build the images locally with `make build-containers` after checking out the repository. Publishing releases is intentionally handled only by the tag-driven GitHub Actions workflow.
 
 
 ## How to pronounce kadalu ?
@@ -84,4 +99,3 @@ One is free to pronounce 'kaDalu' as they wish. Below is a sample of how we pron
 >
 >**Request:** If you like the project, give a github star :-)
 >
-

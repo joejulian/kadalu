@@ -1,3 +1,4 @@
+# Apply with: kubectl apply -n <operator-namespace> -f storage-config.yaml
 ---
 apiVersion: kadalu-operator.storage/v1alpha1
 kind: KadaluStorage
