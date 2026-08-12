@@ -21,6 +21,10 @@ help:
 	@echo "	   make gen-requirements  - Generate requirements file for kadalu components"
 
 build-grpc:
+	# csi.proto is the exact upstream CSI v1.12.0 file (SHA-256
+	# 5b81236a3809f3ff0b877ff9b82215d0b74a8e291d7f3ec6ee1a44f537c0f86a).
+	# Generate with Python 3.12 and the grpcio-tools version pinned in
+	# requirements/ci_merge-requirements.txt.
 	python3 -m grpc_tools.protoc -I./csi/protos --python_out=csi --grpc_python_out=csi ./csi/protos/csi.proto
 
 build-containers: cli-build
@@ -149,16 +153,18 @@ helm-chart:
 	@echo "Creating tgz archive of helm chart(Version: ${KADALU_VERSION}).."
 	cd helm; sed -i -e "s/0.0.0-0/${KADALU_VERSION}/" kadalu/Chart.yaml; tar -czf kadalu-helm-chart.tgz kadalu
 
-# Pass PIP_ARGS="-U" for upgrading module deps, compatible with pip-compile v7.1.0
+# Run with Python 3.12 and the pip-tools version pinned in
+# requirements/ci_merge-requirements.txt. Pass PIP_ARGS="--upgrade" when
+# intentionally refreshing all dependency pins.
 gen-requirements:
 	@echo "Generating requirements file for all kadalu components and CI"
 	@cd requirements; \
-	pip-compile $(PIP_ARGS) --extra=builder -o builder-requirements.txt --allow-unsafe; \
-	pip-compile $(PIP_ARGS) --extra=operator -o operator-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=csi -o csi-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=server -o server-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=ci_submit -o ci_submit-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=ci_merge -o ci_merge-requirements.txt --allow-unsafe
+	pip-compile $(PIP_ARGS) --strip-extras --extra=builder -o builder-requirements.txt --allow-unsafe; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=operator -o operator-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=csi -o csi-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=server -o server-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=ci_submit -o ci_submit-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=ci_merge -o ci_merge-requirements.txt --allow-unsafe
 
 ifeq ($(TWINE_PASSWORD),)
 pypi-upload: pypi-build

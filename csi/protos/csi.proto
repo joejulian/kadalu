@@ -6,12 +6,48 @@ import "google/protobuf/descriptor.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/wrappers.proto";
 
-option go_package = "csi";
+option go_package = 
+  "github.com/container-storage-interface/spec/lib/go/csi";
 
+extend google.protobuf.EnumOptions {
+  // Indicates that this enum is OPTIONAL and part of an experimental
+  // API that may be deprecated and eventually removed between minor
+  // releases.
+  bool alpha_enum = 1060;
+}
+extend google.protobuf.EnumValueOptions {
+  // Indicates that this enum value is OPTIONAL and part of an
+  // experimental API that may be deprecated and eventually removed
+  // between minor releases.
+  bool alpha_enum_value = 1060;
+}
 extend google.protobuf.FieldOptions {
   // Indicates that a field MAY contain information that is sensitive
   // and MUST be treated as such (e.g. not logged).
   bool csi_secret = 1059;
+
+  // Indicates that this field is OPTIONAL and part of an experimental
+  // API that may be deprecated and eventually removed between minor
+  // releases.
+  bool alpha_field = 1060;
+}
+extend google.protobuf.MessageOptions {
+  // Indicates that this message is OPTIONAL and part of an experimental
+  // API that may be deprecated and eventually removed between minor
+  // releases.
+  bool alpha_message = 1060;
+}
+extend google.protobuf.MethodOptions {
+  // Indicates that this method is OPTIONAL and part of an experimental
+  // API that may be deprecated and eventually removed between minor
+  // releases.
+  bool alpha_method = 1060;
+}
+extend google.protobuf.ServiceOptions {
+  // Indicates that this service is OPTIONAL and part of an experimental
+  // API that may be deprecated and eventually removed between minor
+  // releases.
+  bool alpha_service = 1060;
 }
 service Identity {
   rpc GetPluginInfo(GetPluginInfoRequest)
@@ -58,8 +94,51 @@ service Controller {
   rpc ListSnapshots (ListSnapshotsRequest)
     returns (ListSnapshotsResponse) {}
 
+  rpc GetSnapshot (GetSnapshotRequest)
+    returns (GetSnapshotResponse) {
+        option (alpha_method) = true;
+    }
+
   rpc ControllerExpandVolume (ControllerExpandVolumeRequest)
     returns (ControllerExpandVolumeResponse) {}
+
+  rpc ControllerGetVolume (ControllerGetVolumeRequest)
+    returns (ControllerGetVolumeResponse) {
+        option (alpha_method) = true;
+    }
+
+  rpc ControllerModifyVolume (ControllerModifyVolumeRequest)
+    returns (ControllerModifyVolumeResponse) {
+    }
+}
+
+service GroupController {
+  rpc GroupControllerGetCapabilities (
+        GroupControllerGetCapabilitiesRequest)
+    returns (GroupControllerGetCapabilitiesResponse) {}
+
+  rpc CreateVolumeGroupSnapshot(CreateVolumeGroupSnapshotRequest)
+    returns (CreateVolumeGroupSnapshotResponse) {
+    }
+
+  rpc DeleteVolumeGroupSnapshot(DeleteVolumeGroupSnapshotRequest)
+    returns (DeleteVolumeGroupSnapshotResponse) {
+    }
+
+  rpc GetVolumeGroupSnapshot(
+        GetVolumeGroupSnapshotRequest)
+    returns (GetVolumeGroupSnapshotResponse) {
+    }
+}
+
+service SnapshotMetadata {
+  option (alpha_service) = true;
+
+  rpc GetMetadataAllocated(GetMetadataAllocatedRequest)
+    returns (stream GetMetadataAllocatedResponse) {}
+
+  rpc GetMetadataDelta(GetMetadataDeltaRequest)
+    returns (stream GetMetadataDeltaResponse) {}
 }
 
 service Node {
@@ -141,6 +220,23 @@ message PluginCapability {
       // returned by NodeGetInfo to ensure that a given volume is
       // accessible from a given node when scheduling workloads.
       VOLUME_ACCESSIBILITY_CONSTRAINTS = 2;
+
+      // GROUP_CONTROLLER_SERVICE indicates that the Plugin provides
+      // RPCs for operating on groups of volumes. Plugins MAY provide
+      // this capability.
+      // The presence of this capability determines whether the CO will
+      // attempt to invoke the REQUIRED GroupController service RPCs, as
+      // well as specific RPCs as indicated by
+      // GroupControllerGetCapabilities.
+      GROUP_CONTROLLER_SERVICE = 3;
+
+      // SNAPSHOT_METADATA_SERVICE indicates that the Plugin provides
+      // RPCs to retrieve metadata on the allocated blocks of a single
+      // snapshot, or the changed blocks between a pair of snapshots of
+      // the same block volume.
+      // The presence of this capability determines whether the CO will
+      // attempt to invoke the OPTIONAL SnapshotMetadata service RPCs.
+      SNAPSHOT_METADATA_SERVICE = 4 [(alpha_enum_value) = true];
     }
     Type type = 1;
   }
@@ -277,9 +373,10 @@ message CreateVolumeRequest {
   // This field is REQUIRED.
   repeated VolumeCapability volume_capabilities = 3;
 
-  // Plugin specific parameters passed in as opaque key-value pairs.
-  // This field is OPTIONAL. The Plugin is responsible for parsing and
-  // validating these parameters. COs will treat these as opaque.
+  // Plugin specific creation-time parameters passed in as opaque 
+  // key-value pairs. This field is OPTIONAL. The Plugin is responsible 
+  // for parsing and validating these parameters. COs will treat 
+  // these as opaque.
   map<string, string> parameters = 4;
 
   // Secrets required by plugin to complete volume creation request.
@@ -303,6 +400,19 @@ message CreateVolumeRequest {
   // VOLUME_ACCESSIBILITY_CONSTRAINTS plugin capability, the SP MAY
   // choose where the provisioned volume is accessible from.
   TopologyRequirement accessibility_requirements = 7;
+
+  // Plugin specific creation-time parameters passed in as opaque 
+  // key-value pairs. These mutable_parameteres MAY also be
+  // changed during the lifetime of the volume via a subsequent
+  // `ControllerModifyVolume` RPC. This field is OPTIONAL.
+  // The Plugin is responsible for parsing and validating these
+  // parameters. COs will treat these as opaque.
+  
+  // Plugins MUST treat these 
+  // as if they take precedence over the parameters field.
+  // This field SHALL NOT be specified unless the SP has the
+  // MODIFY_VOLUME plugin capability.
+  map<string, string> mutable_parameters = 8;
 }
 
 // Specifies what source the volume will be created from. One of the
@@ -355,6 +465,19 @@ message VolumeCapability {
     // to untrusted entities. The total size of this repeated field
     // SHALL NOT exceed 4 KiB.
     repeated string mount_flags = 2;
+
+    // If SP has VOLUME_MOUNT_GROUP node capability and CO provides
+    // this field then SP MUST ensure that the volume_mount_group
+    // parameter is passed as the group identifier to the underlying
+    // operating system mount system call, with the understanding
+    // that the set of available mount call parameters and/or
+    // mount implementations may vary across operating systems.
+    // Additionally, new file and/or directory entries written to
+    // the underlying filesystem SHOULD be permission-labeled in such a
+    // manner, unless otherwise modified by a workload, that they are
+    // both readable and writable by said mount group identifier.
+    // This is an OPTIONAL field.
+    string volume_mount_group = 3;
   }
 
   // Specify how a volume can be accessed.
@@ -380,6 +503,18 @@ message VolumeCapability {
       // Can be published as read/write at multiple nodes
       // simultaneously.
       MULTI_NODE_MULTI_WRITER = 5;
+
+      // Can only be published once as read/write at a single workload
+      // on a single node, at any given time. SHOULD be used instead of
+      // SINGLE_NODE_WRITER for COs using the experimental
+      // SINGLE_NODE_MULTI_WRITER capability.
+      SINGLE_NODE_SINGLE_WRITER = 6 [(alpha_enum_value) = true];
+
+      // Can be published as read/write at multiple workloads on a
+      // single node simultaneously. SHOULD be used instead of
+      // SINGLE_NODE_WRITER for COs using the experimental
+      // SINGLE_NODE_MULTI_WRITER capability.
+      SINGLE_NODE_MULTI_WRITER = 7 [(alpha_enum_value) = true];
     }
 
     // This field is REQUIRED.
@@ -567,7 +702,7 @@ message TopologyRequirement {
   //   {"region": "R1", "zone": "Z3"}
   // preferred =
   //   {"region": "R1", "zone": "Z3"}
-  // then the the SP SHOULD first attempt to make the provisioned volume
+  // then the SP SHOULD first attempt to make the provisioned volume
   // available from "zone" "Z3" in the "region" "R1" and fall back to
   // "zone" "Z2" in the "region" "R1" if that is not possible.
   //
@@ -581,7 +716,7 @@ message TopologyRequirement {
   // preferred =
   //   {"region": "R1", "zone": "Z4"},
   //   {"region": "R1", "zone": "Z2"}
-  // then the the SP SHOULD first attempt to make the provisioned volume
+  // then the SP SHOULD first attempt to make the provisioned volume
   // accessible from "zone" "Z4" in the "region" "R1" and fall back to
   // "zone" "Z2" in the "region" "R1" if that is not possible. If that
   // is not possible, the SP may choose between either the "zone"
@@ -600,7 +735,7 @@ message TopologyRequirement {
   // preferred =
   //   {"region": "R1", "zone": "Z5"},
   //   {"region": "R1", "zone": "Z3"}
-  // then the the SP SHOULD first attempt to make the provisioned volume
+  // then the SP SHOULD first attempt to make the provisioned volume
   // accessible from the combination of the two "zones" "Z5" and "Z3" in
   // the "region" "R1". If that's not possible, it should fall back to
   // a combination of "Z5" and other possibilities from the list of
@@ -683,9 +818,10 @@ message ControllerPublishVolumeRequest {
   // `Secrets Requirements` section on how to use this field.
   map<string, string> secrets = 5 [(csi_secret) = true];
 
-  // Volume context as returned by CO in CreateVolumeRequest. This field
-  // is OPTIONAL and MUST match the volume_context of the volume
-  // identified by `volume_id`.
+  // Volume context as returned by SP in
+  // CreateVolumeResponse.Volume.volume_context.
+  // This field is OPTIONAL and MUST match the volume_context of the
+  // volume identified by `volume_id`.
   map<string, string> volume_context = 6;
 }
 
@@ -731,9 +867,10 @@ message ValidateVolumeCapabilitiesRequest {
   // The ID of the volume to check. This field is REQUIRED.
   string volume_id = 1;
 
-  // Volume context as returned by CO in CreateVolumeRequest. This field
-  // is OPTIONAL and MUST match the volume_context of the volume
-  // identified by `volume_id`.
+  // Volume context as returned by SP in
+  // CreateVolumeResponse.Volume.volume_context.
+  // This field is OPTIONAL and MUST match the volume_context of the
+  // volume identified by `volume_id`.
   map<string, string> volume_context = 2;
 
   // The capabilities that the CO wants to check for the volume. This
@@ -749,6 +886,10 @@ message ValidateVolumeCapabilitiesRequest {
   // This field is OPTIONAL. Refer to the `Secrets Requirements`
   // section on how to use this field.
   map<string, string> secrets = 5 [(csi_secret) = true];
+
+  // See CreateVolumeRequest.mutable_parameters.
+  // This field is OPTIONAL.
+  map<string, string> mutable_parameters = 6;
 }
 
 message ValidateVolumeCapabilitiesResponse {
@@ -764,6 +905,10 @@ message ValidateVolumeCapabilitiesResponse {
     // The volume creation parameters validated by the plugin.
     // This field is OPTIONAL.
     map<string, string> parameters = 3;
+
+    // The volume creation mutable_parameters validated by the plugin.
+    // This field is OPTIONAL.
+    map<string, string> mutable_parameters = 4;
   }
 
   // Confirmed indicates to the CO the set of capabilities that the
@@ -812,6 +957,12 @@ message ListVolumesResponse {
     // published_node_ids MAY include nodes not published to or
     // reported by the SP. The CO MUST be resilient to that.
     repeated string published_node_ids = 1;
+
+    // Information about the current condition of the volume.
+    // This field is OPTIONAL.
+    // This field MUST be specified if the
+    // VOLUME_CONDITION controller capability is supported.
+    VolumeCondition volume_condition = 2 [(alpha_field) = true];
   }
 
   message Entry {
@@ -834,6 +985,64 @@ message ListVolumesResponse {
   // An empty string is equal to an unspecified field value.
   string next_token = 2;
 }
+message ControllerGetVolumeRequest {
+  option (alpha_message) = true;
+
+  // The ID of the volume to fetch current volume information for.
+  // This field is REQUIRED.
+  string volume_id = 1;
+}
+
+message ControllerGetVolumeResponse {
+  option (alpha_message) = true;
+
+  message VolumeStatus{
+    // A list of all the `node_id` of nodes that this volume is
+    // controller published on.
+    // This field is OPTIONAL.
+    // This field MUST be specified if the LIST_VOLUMES_PUBLISHED_NODES
+    // controller capability is supported.
+    // published_node_ids MAY include nodes not published to or
+    // reported by the SP. The CO MUST be resilient to that.
+    repeated string published_node_ids = 1;
+
+    // Information about the current condition of the volume.
+    // This field is OPTIONAL.
+    // This field MUST be specified if the
+    // VOLUME_CONDITION controller capability is supported.
+    VolumeCondition volume_condition = 2;
+  }
+
+  // This field is REQUIRED
+  Volume volume = 1;
+
+  // This field is REQUIRED.
+  VolumeStatus status = 2;
+}
+message ControllerModifyVolumeRequest {
+  // Contains identity information for the existing volume.
+  // This field is REQUIRED.
+  string volume_id = 1;
+
+  // Secrets required by plugin to complete modify volume request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  map<string, string> secrets = 2 [(csi_secret) = true];
+
+  // Plugin specific volume attributes to mutate, passed in as 
+  // opaque key-value pairs. 
+  // This field is REQUIRED. The Plugin is responsible for
+  // parsing and validating these parameters. COs will treat these
+  // as opaque. The CO SHOULD specify the intended values of all mutable
+  // parameters it intends to modify. SPs MUST NOT modify volumes based
+  // on the absence of keys, only keys that are specified should result
+  // in modifications to the volume.
+  map<string, string> mutable_parameters = 3;
+}
+
+message ControllerModifyVolumeResponse {
+}
+
 message GetCapacityRequest {
   // If specified, the Plugin SHALL report the capacity of the storage
   // that can be used to provision volumes that satisfy ALL of the
@@ -865,6 +1074,41 @@ message GetCapacityResponse {
   // storage. This field is REQUIRED.
   // The value of this field MUST NOT be negative.
   int64 available_capacity = 1;
+
+  // The largest size that may be used in a
+  // CreateVolumeRequest.capacity_range.required_bytes field
+  // to create a volume with the same parameters as those in
+  // GetCapacityRequest.
+  //
+  // If `volume_capabilities` or `parameters` is
+  // specified in the request, the Plugin SHALL take those into
+  // consideration when calculating the minimum volume size of the
+  // storage.
+  //
+  // This field is OPTIONAL. MUST NOT be negative.
+  // The Plugin SHOULD provide a value for this field if it has
+  // a maximum size for individual volumes and leave it unset
+  // otherwise. COs MAY use it to make decision about
+  // where to create volumes.
+  google.protobuf.Int64Value maximum_volume_size = 2;
+
+  // The smallest size that may be used in a
+  // CreateVolumeRequest.capacity_range.limit_bytes field
+  // to create a volume with the same parameters as those in
+  // GetCapacityRequest.
+  //
+  // If `volume_capabilities` or `parameters` is
+  // specified in the request, the Plugin SHALL take those into
+  // consideration when calculating the maximum volume size of the
+  // storage.
+  //
+  // This field is OPTIONAL. MUST NOT be negative.
+  // The Plugin SHOULD provide a value for this field if it has
+  // a minimum size for individual volumes and leave it unset
+  // otherwise. COs MAY use it to make decision about
+  // where to create volumes.
+  google.protobuf.Int64Value minimum_volume_size = 3
+    [(alpha_field) = true];
 }
 message ControllerGetCapabilitiesRequest {
   // Intentionally empty.
@@ -906,8 +1150,46 @@ message ControllerServiceCapability {
       EXPAND_VOLUME = 9;
 
       // Indicates the SP supports the
-      // ListVolumesResponse.entry.published_nodes field
+      // ListVolumesResponse.entry.published_node_ids field and the
+      // ControllerGetVolumeResponse.published_node_ids field.
+      // The SP MUST also support PUBLISH_UNPUBLISH_VOLUME.
       LIST_VOLUMES_PUBLISHED_NODES = 10;
+
+      // Indicates that the Controller service can report volume
+      // conditions.
+      // An SP MAY implement `VolumeCondition` in only the Controller
+      // Plugin, only the Node Plugin, or both.
+      // If `VolumeCondition` is implemented in both the Controller and
+      // Node Plugins, it SHALL report from different perspectives.
+      // If for some reason Controller and Node Plugins report
+      // misaligned volume conditions, CO SHALL assume the worst case
+      // is the truth.
+      // Note that, for alpha, `VolumeCondition` is intended be
+      // informative for humans only, not for automation.
+      VOLUME_CONDITION = 11 [(alpha_enum_value) = true];
+
+      // Indicates the SP supports the ControllerGetVolume RPC.
+      // This enables COs to, for example, fetch per volume
+      // condition after a volume is provisioned.
+      GET_VOLUME = 12 [(alpha_enum_value) = true];
+
+      // Indicates the SP supports the SINGLE_NODE_SINGLE_WRITER and/or
+      // SINGLE_NODE_MULTI_WRITER access modes.
+      // These access modes are intended to replace the
+      // SINGLE_NODE_WRITER access mode to clarify the number of writers
+      // for a volume on a single node. Plugins MUST accept and allow
+      // use of the SINGLE_NODE_WRITER access mode when either
+      // SINGLE_NODE_SINGLE_WRITER and/or SINGLE_NODE_MULTI_WRITER are
+      // supported, in order to permit older COs to continue working.
+      SINGLE_NODE_MULTI_WRITER = 13 [(alpha_enum_value) = true];
+
+      // Indicates the SP supports modifying volume with mutable
+      // parameters. See ControllerModifyVolume for details.
+      MODIFY_VOLUME = 14;
+
+      // Indicates the SP supports the GetSnapshot RPC.
+      // This enables COs to fetch an existing snapshot.
+      GET_SNAPSHOT = 15 [(alpha_enum_value) = true];
     }
 
     Type type = 1;
@@ -991,6 +1273,21 @@ message Snapshot {
   // `volume_content_source` in a `CreateVolumeRequest`. The default
   // value is false. This field is REQUIRED.
   bool ready_to_use = 5;
+
+  // The ID of the volume group snapshot that this snapshot is part of.
+  // It uniquely identifies the group snapshot on the storage system.
+  // This field is OPTIONAL.
+  // If this snapshot is a member of a volume group snapshot, and it
+  // MUST NOT be deleted as a stand alone snapshot, then the SP
+  // MUST provide the ID of the volume group snapshot in this field.
+  // If provided, CO MUST use this field in subsequent volume group
+  // snapshot operations to indicate that this snapshot is part of the
+  // specified group snapshot.
+  // If not provided, CO SHALL treat the snapshot as independent,
+  // and SP SHALL allow it to be deleted separately.
+  // If this message is inside a VolumeGroupSnapshot message, the value
+  // MUST be the same as the group_snapshot_id in that message.
+  string group_snapshot_id = 6;
 }
 message DeleteSnapshotRequest {
   // The ID of the snapshot to be deleted.
@@ -1055,6 +1352,25 @@ message ListSnapshotsResponse {
   // An empty string is equal to an unspecified field value.
   string next_token = 2;
 }
+message GetSnapshotRequest {
+  option (alpha_message) = true;
+
+  // The ID of the snapshot to fetch current snapshot information for.
+  // This field is REQUIRED.
+  string snapshot_id = 1;
+
+  // Secrets required by plugin to complete GetSnapshot request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  map<string, string> secrets = 2 [(csi_secret) = true];
+}
+
+message GetSnapshotResponse {
+  option (alpha_message) = true;
+
+  // This field is REQUIRED
+  Snapshot snapshot = 1;
+}
 message ControllerExpandVolumeRequest {
   // The ID of the volume to expand. This field is REQUIRED.
   string volume_id = 1;
@@ -1106,6 +1422,10 @@ message NodeStageVolumeRequest {
   // CO SHALL be responsible for creating the directory if it does not
   // exist.
   // This is a REQUIRED field.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string staging_target_path = 3;
 
   // Volume capability describing how the CO intends to use this volume.
@@ -1119,9 +1439,10 @@ message NodeStageVolumeRequest {
   // section on how to use this field.
   map<string, string> secrets = 5 [(csi_secret) = true];
 
-  // Volume context as returned by CO in CreateVolumeRequest. This field
-  // is OPTIONAL and MUST match the volume_context of the volume
-  // identified by `volume_id`.
+  // Volume context as returned by SP in
+  // CreateVolumeResponse.Volume.volume_context.
+  // This field is OPTIONAL and MUST match the volume_context of the
+  // volume identified by `volume_id`.
   map<string, string> volume_context = 6;
 }
 
@@ -1135,6 +1456,10 @@ message NodeUnstageVolumeRequest {
   // The path at which the volume was staged. It MUST be an absolute
   // path in the root filesystem of the process serving this request.
   // This is a REQUIRED field.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string staging_target_path = 2;
 }
 
@@ -1158,6 +1483,10 @@ message NodePublishVolumeRequest {
   // It MUST be set if the Node Plugin implements the
   // `STAGE_UNSTAGE_VOLUME` node capability.
   // This is an OPTIONAL field.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string staging_target_path = 3;
 
   // The path to which the volume will be published. It MUST be an
@@ -1172,6 +1501,10 @@ message NodePublishVolumeRequest {
   // mounted directory at target_path.
   // Creation of target_path is the responsibility of the SP.
   // This is a REQUIRED field.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string target_path = 4;
 
   // Volume capability describing how the CO intends to use this volume.
@@ -1189,9 +1522,10 @@ message NodePublishVolumeRequest {
   // section on how to use this field.
   map<string, string> secrets = 7 [(csi_secret) = true];
 
-  // Volume context as returned by CO in CreateVolumeRequest. This field
-  // is OPTIONAL and MUST match the volume_context of the volume
-  // identified by `volume_id`.
+  // Volume context as returned by SP in
+  // CreateVolumeResponse.Volume.volume_context.
+  // This field is OPTIONAL and MUST match the volume_context of the
+  // volume identified by `volume_id`.
   map<string, string> volume_context = 8;
 }
 
@@ -1206,6 +1540,10 @@ message NodeUnpublishVolumeRequest {
   // path in the root filesystem of the process serving this request.
   // The SP MUST delete the file or directory it created at this path.
   // This is a REQUIRED field.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string target_path = 2;
 }
 
@@ -1221,6 +1559,10 @@ message NodeGetVolumeStatsRequest {
   // It MUST be an absolute path in the root filesystem of
   // the process serving this request.
   // This is a REQUIRED field.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string volume_path = 2;
 
   // The path where the volume is staged, if the plugin has the
@@ -1228,12 +1570,21 @@ message NodeGetVolumeStatsRequest {
   // If not empty, it MUST be an absolute path in the root
   // filesystem of the process serving this request.
   // This field is OPTIONAL.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string staging_target_path = 3;
 }
 
 message NodeGetVolumeStatsResponse {
   // This field is OPTIONAL.
   repeated VolumeUsage usage = 1;
+  // Information about the current condition of the volume.
+  // This field is OPTIONAL.
+  // This field MUST be specified if the VOLUME_CONDITION node
+  // capability is supported.
+  VolumeCondition volume_condition = 2 [(alpha_field) = true];
 }
 
 message VolumeUsage {
@@ -1257,6 +1608,20 @@ message VolumeUsage {
   // Units by which values are measured. This field is REQUIRED.
   Unit unit = 4;
 }
+
+// VolumeCondition represents the current condition of a volume.
+message VolumeCondition {
+  option (alpha_message) = true;
+
+  // Normal volumes are available for use and operating optimally.
+  // An abnormal volume does not meet these criteria.
+  // This field is REQUIRED.
+  bool abnormal = 1;
+
+  // The message describing the condition of the volume.
+  // This field is REQUIRED.
+  string message = 2;
+}
 message NodeGetCapabilitiesRequest {
   // Intentionally empty.
 }
@@ -1279,6 +1644,34 @@ message NodeServiceCapability {
       GET_VOLUME_STATS = 2;
       // See VolumeExpansion for details.
       EXPAND_VOLUME = 3;
+      // Indicates that the Node service can report volume conditions.
+      // An SP MAY implement `VolumeCondition` in only the Node
+      // Plugin, only the Controller Plugin, or both.
+      // If `VolumeCondition` is implemented in both the Node and
+      // Controller Plugins, it SHALL report from different
+      // perspectives.
+      // If for some reason Node and Controller Plugins report
+      // misaligned volume conditions, CO SHALL assume the worst case
+      // is the truth.
+      // Note that, for alpha, `VolumeCondition` is intended to be
+      // informative for humans only, not for automation.
+      VOLUME_CONDITION = 4 [(alpha_enum_value) = true];
+
+      // Indicates the SP supports the SINGLE_NODE_SINGLE_WRITER and/or
+      // SINGLE_NODE_MULTI_WRITER access modes.
+      // These access modes are intended to replace the
+      // SINGLE_NODE_WRITER access mode to clarify the number of writers
+      // for a volume on a single node. Plugins MUST accept and allow
+      // use of the SINGLE_NODE_WRITER access mode (subject to the
+      // processing rules for NodePublishVolume), when either
+      // SINGLE_NODE_SINGLE_WRITER and/or SINGLE_NODE_MULTI_WRITER are
+      // supported, in order to permit older COs to continue working.
+      SINGLE_NODE_MULTI_WRITER = 5 [(alpha_enum_value) = true];
+
+      // Indicates that Node service supports mounting volumes
+      // with provided volume group identifier during node stage
+      // or node publish RPC calls.
+      VOLUME_MOUNT_GROUP = 6;
     }
 
     Type type = 1;
@@ -1301,6 +1694,10 @@ message NodeGetInfoResponse {
   // `ControllerPublishVolume`, to refer to this node.
   // The SP is NOT responsible for global uniqueness of node_id across
   // multiple SPs.
+  // This field overrides the general CSI size limit.
+  // The size of this field SHALL NOT exceed 256 bytes. The general
+  // CSI size limit, 128 byte, is RECOMMENDED for best backwards
+  // compatibility.
   string node_id = 1;
 
   // Maximum number of volumes that controller can publish to the node.
@@ -1334,6 +1731,10 @@ message NodeExpandVolumeRequest {
   string volume_id = 1;
 
   // The path on which volume is available. This field is REQUIRED.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string volume_path = 2;
 
   // This allows CO to specify the capacity requirements of the volume
@@ -1349,6 +1750,10 @@ message NodeExpandVolumeRequest {
   // If not empty, it MUST be an absolute path in the root
   // filesystem of the process serving this request.
   // This field is OPTIONAL.
+  // This field overrides the general CSI size limit.
+  // SP SHOULD support the maximum path length allowed by the operating
+  // system/filesystem, but, at a minimum, SP MUST accept a max path
+  // length of at least 128 bytes.
   string staging_target_path = 4;
 
   // Volume capability describing how the CO intends to use this volume.
@@ -1361,9 +1766,337 @@ message NodeExpandVolumeRequest {
   // access_type from given volume_path for the volume and perform
   // node expansion. This is an OPTIONAL field.
   VolumeCapability volume_capability = 5;
+
+  // Secrets required by plugin to complete node expand volume request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  map<string, string> secrets = 6
+    [(csi_secret) = true, (alpha_field) = true];
 }
 
 message NodeExpandVolumeResponse {
   // The capacity of the volume in bytes. This field is OPTIONAL.
   int64 capacity_bytes = 1;
+}
+message GroupControllerGetCapabilitiesRequest {
+  // Intentionally empty.
+}
+
+message GroupControllerGetCapabilitiesResponse {
+  // All the capabilities that the group controller service supports.
+  // This field is OPTIONAL.
+  repeated GroupControllerServiceCapability capabilities = 1;
+}
+
+// Specifies a capability of the group controller service.
+message GroupControllerServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+
+      // Indicates that the group controller plugin supports
+      // creating, deleting, and getting details of a volume
+      // group snapshot.
+      CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT = 1;
+    }
+
+    Type type = 1;
+  }
+
+  oneof type {
+    // RPC that the controller supports.
+    RPC rpc = 1;
+  }
+}
+message CreateVolumeGroupSnapshotRequest {
+  // The suggested name for the group snapshot. This field is REQUIRED
+  // for idempotency.
+  // Any Unicode string that conforms to the length limit is allowed
+  // except those containing the following banned characters:
+  // U+0000-U+0008, U+000B, U+000C, U+000E-U+001F, U+007F-U+009F.
+  // (These are control characters other than commonly used whitespace.)
+  string name = 1;
+
+  // volume IDs of the source volumes to be snapshotted together.
+  // This field is REQUIRED.
+  repeated string source_volume_ids = 2;
+
+  // Secrets required by plugin to complete
+  // ControllerCreateVolumeGroupSnapshot request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  // The secrets provided in this field SHOULD be the same for 
+  // all group snapshot operations on the same group snapshot. 
+  map<string, string> secrets = 3 [(csi_secret) = true];
+
+  // Plugin specific parameters passed in as opaque key-value pairs.
+  // This field is OPTIONAL. The Plugin is responsible for parsing and
+  // validating these parameters. COs will treat these as opaque.
+  map<string, string> parameters = 4;
+}
+
+message CreateVolumeGroupSnapshotResponse {
+  // Contains all attributes of the newly created group snapshot.
+  // This field is REQUIRED.
+  VolumeGroupSnapshot group_snapshot = 1;
+}
+
+message VolumeGroupSnapshot {
+  // The identifier for this group snapshot, generated by the plugin.
+  // This field MUST contain enough information to uniquely identify
+  // this specific snapshot vs all other group snapshots supported by
+  // this plugin.
+  // This field SHALL be used by the CO in subsequent calls to refer to
+  // this group snapshot.
+  // The SP is NOT responsible for global uniqueness of
+  // group_snapshot_id across multiple SPs.
+  // This field is REQUIRED.
+  string group_snapshot_id = 1;
+
+  // A list of snapshots belonging to this group.
+  // This field is REQUIRED.
+  repeated Snapshot snapshots = 2;
+
+  // Timestamp of when the volume group snapshot was taken.
+  // This field is REQUIRED.
+  .google.protobuf.Timestamp creation_time = 3;
+
+  // Indicates if all individual snapshots in the group snapshot
+  // are ready to use as a `volume_content_source` in a
+  // `CreateVolumeRequest`. The default value is false.
+  // If any snapshot in the list of snapshots in this message have
+  // ready_to_use set to false, the SP MUST set this field to false.
+  // If all of the snapshots in the list of snapshots in this message
+  // have ready_to_use set to true, the SP SHOULD set this field to
+  // true.
+  // This field is REQUIRED.
+  bool ready_to_use = 4;
+}
+message DeleteVolumeGroupSnapshotRequest {
+  // The ID of the group snapshot to be deleted.
+  // This field is REQUIRED.
+  string group_snapshot_id = 1;
+
+  // A list of snapshot IDs that are part of this group snapshot.
+  // If SP does not need to rely on this field to delete the snapshots
+  // in the group, it SHOULD check this field and report an error
+  // if it has the ability to detect a mismatch.
+  // Some SPs require this list to delete the snapshots in the group.
+  // If SP needs to use this field to delete the snapshots in the
+  // group, it MUST report an error if it has the ability to detect
+  // a mismatch.
+  // This field is REQUIRED.
+  repeated string snapshot_ids = 2;
+
+  // Secrets required by plugin to complete group snapshot deletion
+  // request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  // The secrets provided in this field SHOULD be the same for
+  // all group snapshot operations on the same group snapshot.
+  map<string, string> secrets = 3 [(csi_secret) = true];
+}
+
+message DeleteVolumeGroupSnapshotResponse {
+  // Intentionally empty.
+}
+message GetVolumeGroupSnapshotRequest {
+  // The ID of the group snapshot to fetch current group snapshot
+  // information for.
+  // This field is REQUIRED.
+  string group_snapshot_id = 1;
+
+  // A list of snapshot IDs that are part of this group snapshot.
+  // If SP does not need to rely on this field to get the snapshots
+  // in the group, it SHOULD check this field and report an error
+  // if it has the ability to detect a mismatch.
+  // Some SPs require this list to get the snapshots in the group.
+  // If SP needs to use this field to get the snapshots in the
+  // group, it MUST report an error if it has the ability to detect
+  // a mismatch.
+  // This field is REQUIRED.
+  repeated string snapshot_ids = 2;
+
+  // Secrets required by plugin to complete
+  // GetVolumeGroupSnapshot request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  // The secrets provided in this field SHOULD be the same for
+  // all group snapshot operations on the same group snapshot.
+  map<string, string> secrets = 3 [(csi_secret) = true];
+}
+
+message GetVolumeGroupSnapshotResponse {
+  // This field is REQUIRED
+  VolumeGroupSnapshot group_snapshot = 1;
+}
+// BlockMetadata specifies a data range.
+message BlockMetadata {
+  // This is the zero based byte position in the volume or snapshot,
+  // measured from the start of the object.
+  // This field is REQUIRED.
+  int64 byte_offset = 1;
+
+  // This is the size of the data range.
+  // size_bytes MUST be greater than zero.
+  // This field is REQUIRED.
+  int64 size_bytes = 2;
+}
+enum BlockMetadataType {
+  UNKNOWN = 0;
+
+  // The FIXED_LENGTH value indicates that data ranges are
+  // returned in fixed size blocks.
+  FIXED_LENGTH = 1;
+
+  // The VARIABLE_LENGTH value indicates that data ranges
+  // are returned in potentially variable sized extents.
+  VARIABLE_LENGTH = 2;
+}
+// The GetMetadataAllocatedRequest message is used to solicit metadata
+// on the allocated blocks of a snapshot: i.e. this identifies the
+// data ranges that have valid data as they were the target of some
+// previous write operation on the volume.
+message GetMetadataAllocatedRequest {
+  // This is the identifier of the snapshot.
+  // This field is REQUIRED.
+  string snapshot_id = 1;
+
+  // This indicates the zero based starting byte position in the volume
+  // snapshot from which the result should be computed.
+  // It is intended to be used to continue a previously interrupted
+  // call.
+  // The CO SHOULD specify this value to be the offset of the byte
+  // position immediately after the last byte of the last data range
+  // received, if continuing an interrupted operation, or zero if not.
+  // The SP MUST ensure that the returned response stream does not
+  // contain BlockMetadata tuples that end before the requested
+  // starting_offset: i.e. if S is the requested starting_offset, and
+  // B0 is block_metadata[0] of the first message in the response
+  // stream, then (S < B0.byte_offset + B0.size_bytes) must be true.
+  // This field is REQUIRED.
+  int64 starting_offset = 2;
+
+  // This is an optional parameter, and if non-zero it specifies the
+  // maximum number of tuples to be returned in each
+  // GetMetadataAllocatedResponse message returned by the RPC stream.
+  // The plugin will determine an appropriate value if 0, and is
+  // always free to send less than the requested value.
+  // This field is OPTIONAL.
+  int32 max_results = 3;
+
+  // Secrets required by plugin to complete the request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  map<string, string> secrets = 4 [(csi_secret) = true];
+}
+
+// GetMetadataAllocatedResponse messages are returned in a gRPC stream.
+// Cumulatively, they provide information on the allocated data
+// ranges in the snapshot.
+message GetMetadataAllocatedResponse {
+  // This specifies the style used in the BlockMetadata sequence.
+  // This value must be the same in all such messages returned by
+  // the stream.
+  // If block_metadata_type is FIXED_LENGTH, then the size_bytes field
+  // of each message in the block_metadata list MUST be constant.
+  // This field is REQUIRED.
+  BlockMetadataType block_metadata_type = 1;
+
+  // This returns the capacity of the underlying volume in bytes.
+  // This value must be the same in all such messages returned by
+  // the stream.
+  // This field is REQUIRED.
+  int64 volume_capacity_bytes = 2;
+
+  // This is a list of data range tuples.
+  // If the value of max_results in the GetMetadataAllocatedRequest
+  // message is greater than zero, then the number of entries in this
+  // list MUST be less than or equal to that value.
+  // The SP MUST respect the value of starting_offset in the request.
+  // The byte_offset fields of adjacent BlockMetadata messages
+  // MUST be strictly increasing and messages MUST NOT overlap:
+  // i.e. for any two BlockMetadata messages, A and B, if A is returned
+  // before B, then (A.byte_offset + A.size_bytes <= B.byte_offset)
+  // MUST be true.
+  // This MUST also be true if A and B are from block_metadata lists in
+  // different GetMetadataAllocatedResponse messages in the gRPC stream.
+  // This field is OPTIONAL.
+  repeated BlockMetadata block_metadata = 3;
+}
+// The GetMetadataDeltaRequest message is used to solicit metadata on
+// the data ranges that have changed between two snapshots.
+message GetMetadataDeltaRequest {
+  // This is the identifier of the snapshot against which changes
+  // are to be computed.
+  // This field is REQUIRED.
+  string base_snapshot_id = 1;
+
+  // This is the identifier of a second snapshot in the same volume,
+  // created after the base snapshot.
+  // This field is REQUIRED.
+  string target_snapshot_id = 2;
+
+  // This indicates the zero based starting byte position in the volume
+  // snapshot from which the result should be computed.
+  // It is intended to be used to continue a previously interrupted
+  // call.
+  // The CO SHOULD specify this value to be the offset of the byte
+  // position immediately after the last byte of the last data range
+  // received, if continuing an interrupted operation, or zero if not.
+  // The SP MUST ensure that the returned response stream does not
+  // contain BlockMetadata tuples that end before the requested
+  // starting_offset: i.e. if S is the requested starting_offset, and
+  // B0 is block_metadata[0] of the first message in the response
+  // stream, then (S < B0.byte_offset + B0.size_bytes) must be true.
+  // This field is REQUIRED.
+  int64 starting_offset = 3;
+
+  // This is an optional parameter, and if non-zero it specifies the
+  // maximum number of tuples to be returned in each
+  // GetMetadataDeltaResponse message returned by the RPC stream.
+  // The plugin will determine an appropriate value if 0, and is
+  // always free to send less than the requested value.
+  // This field is OPTIONAL.
+  int32 max_results = 4;
+
+  // Secrets required by plugin to complete the request.
+  // This field is OPTIONAL. Refer to the `Secrets Requirements`
+  // section on how to use this field.
+  map<string, string> secrets = 5 [(csi_secret) = true];
+}
+
+// GetMetadataDeltaResponse messages are returned in a gRPC stream.
+// Cumulatively, they provide information on the data ranges that
+// have changed between the base and target snapshots specified
+// in the GetMetadataDeltaRequest message.
+message GetMetadataDeltaResponse {
+  // This specifies the style used in the BlockMetadata sequence.
+  // This value must be the same in all such messages returned by
+  // the stream.
+  // If block_metadata_type is FIXED_LENGTH, then the size_bytes field
+  // of each message in the block_metadata list MUST be constant.
+  // This field is REQUIRED.
+  BlockMetadataType block_metadata_type = 1;
+
+  // This returns the capacity of the underlying volume in bytes.
+  // This value must be the same in all such messages returned by
+  // the stream.
+  // This field is REQUIRED.
+  int64 volume_capacity_bytes = 2;
+
+  // This is a list of data range tuples.
+  // If the value of max_results in the GetMetadataDeltaRequest message
+  // is greater than zero, then the number of entries in this list MUST
+  // be less than or equal to that value.
+  // The SP MUST respect the value of starting_offset in the request.
+  // The byte_offset fields of adjacent BlockMetadata messages
+  // MUST be strictly increasing and messages MUST NOT overlap:
+  // i.e. for any two BlockMetadata messages, A and B, if A is returned
+  // before B, then (A.byte_offset + A.size_bytes <= B.byte_offset)
+  // MUST be true.
+  // This MUST also be true if A and B are from block_metadata lists in
+  // different GetMetadataDeltaResponse messages in the gRPC stream.
+  // This field is OPTIONAL.
+  repeated BlockMetadata block_metadata = 3;
 }
