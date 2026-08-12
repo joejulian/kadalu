@@ -17,10 +17,15 @@ amd64/arm64 image tags, stages the GitHub release, and only then updates
 `latest` for a stable version. Pre-release tags such as `1.36.0-rc.1` never
 move `latest`.
 
-The repository must have `DOCKER_USER` and `DOCKER_PASSWORD` Actions secrets,
-and `DOCKER_USER` must match the repository owner. PyPI publication is skipped
-unless this fork is explicitly configured with its own `TWINE_PASSWORD`; the
-existing `kadalu-quotad` project name belongs to upstream.
+Container images are published to `ghcr.io/joejulian` with the workflow's
+short-lived `GITHUB_TOKEN`; no long-lived registry secret is required. GitHub
+creates new container packages as private. After the first development build,
+change `kadalu-builder`, `kadalu-csi`, `kadalu-operator`, and `kadalu-server`
+to public in the account's package settings. The development and release
+workflows verify anonymous pulls and fail while any package remains private.
+PyPI publication is skipped unless this fork is explicitly configured with
+its own `TWINE_PASSWORD`; the existing `kadalu-quotad` project name belongs to
+upstream.
 
 Check the [Release URL here](https://github.com/joejulian/kadalu/releases)
 

@@ -2,7 +2,7 @@
 
 CSI_PYLINT_OPTS = --generated-members='csi_pb2.*'
 
-IMAGES_HUB?=docker.io
+IMAGES_HUB?=ghcr.io
 DOCKER_USER?=joejulian
 KADALU_VERSION?=devel
 KADALU_LATEST?=latest

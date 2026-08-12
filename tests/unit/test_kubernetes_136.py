@@ -73,6 +73,46 @@ def _helm_documents():
     return [document for document in yaml.safe_load_all(rendered) if document]
 
 
+def test_fork_images_default_to_ghcr_namespace():
+    values = yaml.safe_load(
+        (ROOT / "helm/kadalu/values.yaml").read_text(encoding="utf-8")
+    )
+
+    assert values["global"]["image"] == {
+        "registry": "ghcr.io",
+        "repository": "joejulian",
+        "pullPolicy": "IfNotPresent",
+    }
+
+    for manifest in sorted((ROOT / "manifests").glob("kadalu-operator*.yaml")):
+        documents = [
+            document
+            for document in yaml.safe_load_all(
+                manifest.read_text(encoding="utf-8")
+            )
+            if document
+        ]
+        operator = next(
+            document
+            for document in documents
+            if document.get("kind") == "Deployment"
+            and document["metadata"]["name"] == "operator"
+        )
+        container = operator["spec"]["template"]["spec"]["containers"][0]
+        assert container["image"] == (
+            "ghcr.io/joejulian/kadalu-operator:devel"
+        )
+
+    for dockerfile in (
+        ROOT / "csi/Dockerfile",
+        ROOT / "kadalu_operator/Dockerfile",
+        ROOT / "server/Dockerfile",
+    ):
+        assert dockerfile.read_text(encoding="utf-8").splitlines()[0] == (
+            'ARG builder_image="ghcr.io/joejulian/kadalu-builder:devel"'
+        )
+
+
 def test_current_multi_arch_csi_sidecars_are_digest_pinned():
     documents = _render_csi_documents()
     containers = {

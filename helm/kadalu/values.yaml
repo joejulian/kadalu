@@ -6,7 +6,7 @@ global:
   # Empty uses the packaged chart version; source-tree renders use "devel".
   kadaluVersion: ''
   image:
-    registry: 'docker.io'
+    registry: 'ghcr.io'
     repository: 'joejulian'
     pullPolicy: 'IfNotPresent'
   kubeletDir: ''

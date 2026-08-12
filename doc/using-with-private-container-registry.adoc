@@ -22,11 +22,11 @@ Use a tool that preserves multi-architecture image indexes and digests. For
 example, with `skopeo`:
 
 ----
-skopeo copy --all docker://docker.io/joejulian/kadalu-csi:<kadalu-version> \
+skopeo copy --all docker://ghcr.io/joejulian/kadalu-csi:<kadalu-version> \
   docker://registry.example.invalid:5000/kadalu/kadalu-csi:<kadalu-version>
-skopeo copy --all docker://docker.io/joejulian/kadalu-operator:<kadalu-version> \
+skopeo copy --all docker://ghcr.io/joejulian/kadalu-operator:<kadalu-version> \
   docker://registry.example.invalid:5000/kadalu/kadalu-operator:<kadalu-version>
-skopeo copy --all docker://docker.io/joejulian/kadalu-server:<kadalu-version> \
+skopeo copy --all docker://ghcr.io/joejulian/kadalu-server:<kadalu-version> \
   docker://registry.example.invalid:5000/kadalu/kadalu-server:<kadalu-version>
 skopeo copy --all \
   docker://docker.io/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \

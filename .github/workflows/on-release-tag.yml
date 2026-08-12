@@ -121,27 +121,22 @@ jobs:
     needs:
       - validate-release
       - build-artifacts
+    permissions:
+      actions: read
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Require all publishing credentials
-        env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          DOCKER_USER: ${{ secrets.DOCKER_USER }}
-        run: |
-          if [[ -z "${DOCKER_USER}" || -z "${DOCKER_PASSWORD}" ]]; then
-            echo "DOCKER_USER and DOCKER_PASSWORD are required for a release" >&2
-            exit 1
-          fi
-          if [[ "${DOCKER_USER}" != "${GITHUB_REPOSITORY_OWNER}" ]]; then
-            echo "DOCKER_USER must exactly match github.repository_owner" >&2
-            exit 1
-          fi
-
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Derive GHCR namespace
+        id: registry
+        run: |
+          echo "namespace=${GITHUB_REPOSITORY_OWNER,,}" >>"${GITHUB_OUTPUT}"
 
       - name: Download temporary release bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -164,24 +159,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Preserve immutable version tags
         id: images
         env:
           EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
           IMAGE_TAG: ${{ needs.validate-release.outputs.version }}
-          REGISTRY_NAMESPACE: ${{ github.repository_owner }}
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
         run: |
           check_image() {
             local key="$1"
             local image="$2"
             local output
-            local reference="docker.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}"
+            local reference="ghcr.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}"
 
             if output=$(docker buildx imagetools inspect "${reference}" 2>&1); then
               tests/ci/verify-image-provenance.sh \
@@ -197,7 +193,7 @@ jobs:
             fi
           }
 
-          check_image builder builder
+          check_image builder kadalu-builder
           check_image csi kadalu-csi
           check_image operator kadalu-operator
           check_image server kadalu-server
@@ -211,7 +207,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           no-cache: true
-          tags: docker.io/${{ github.repository_owner }}/builder:${{ needs.validate-release.outputs.version }}
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ needs.validate-release.outputs.version }}
           build-args: |
             version=${{ needs.validate-release.outputs.version }}
             builddate=${{ steps.metadata.outputs.builddate }}
@@ -228,9 +224,9 @@ jobs:
           target: prod
           push: true
           no-cache: true
-          tags: docker.io/${{ github.repository_owner }}/kadalu-csi:${{ needs.validate-release.outputs.version }}
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-csi:${{ needs.validate-release.outputs.version }}
           build-args: |
-            builder_image=docker.io/${{ github.repository_owner }}/builder:${{ needs.validate-release.outputs.version }}
+            builder_image=ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ needs.validate-release.outputs.version }}
             version=${{ needs.validate-release.outputs.version }}
             builddate=${{ steps.metadata.outputs.builddate }}
             revision=${{ github.sha }}
@@ -246,9 +242,9 @@ jobs:
           target: prod
           push: true
           no-cache: true
-          tags: docker.io/${{ github.repository_owner }}/kadalu-operator:${{ needs.validate-release.outputs.version }}
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-operator:${{ needs.validate-release.outputs.version }}
           build-args: |
-            builder_image=docker.io/${{ github.repository_owner }}/builder:${{ needs.validate-release.outputs.version }}
+            builder_image=ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ needs.validate-release.outputs.version }}
             version=${{ needs.validate-release.outputs.version }}
             builddate=${{ steps.metadata.outputs.builddate }}
             revision=${{ github.sha }}
@@ -264,9 +260,9 @@ jobs:
           target: prod
           push: true
           no-cache: true
-          tags: docker.io/${{ github.repository_owner }}/kadalu-server:${{ needs.validate-release.outputs.version }}
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-server:${{ needs.validate-release.outputs.version }}
           build-args: |
-            builder_image=docker.io/${{ github.repository_owner }}/builder:${{ needs.validate-release.outputs.version }}
+            builder_image=ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ needs.validate-release.outputs.version }}
             version=${{ needs.validate-release.outputs.version }}
             builddate=${{ steps.metadata.outputs.builddate }}
             revision=${{ github.sha }}
@@ -276,13 +272,25 @@ jobs:
         env:
           EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
           IMAGE_TAG: ${{ needs.validate-release.outputs.version }}
-          REGISTRY_NAMESPACE: ${{ github.repository_owner }}
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
         run: |
-          for image in builder kadalu-csi kadalu-operator kadalu-server; do
+          for image in kadalu-builder kadalu-csi kadalu-operator kadalu-server; do
             tests/ci/verify-image-provenance.sh \
-              "docker.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}" \
+              "ghcr.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}" \
               "${GITHUB_SHA}" \
               "${EXPECTED_SOURCE}"
+          done
+
+      - name: Verify version images are anonymously pullable
+        env:
+          IMAGE_TAG: ${{ needs.validate-release.outputs.version }}
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
+        run: |
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf -- "${anonymous_config}"' EXIT
+          for image in kadalu-builder kadalu-csi kadalu-operator kadalu-server; do
+            DOCKER_CONFIG="${anonymous_config}" docker manifest inspect \
+              "ghcr.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}" >/dev/null
           done
 
   publish-github-release:
@@ -505,41 +513,47 @@ jobs:
     needs:
       - validate-release
       - finalize-release
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - name: Require exact Docker Hub credentials
-        env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          DOCKER_USER: ${{ secrets.DOCKER_USER }}
+      - name: Derive GHCR namespace
+        id: registry
         run: |
-          if [[ -z "${DOCKER_USER}" || -z "${DOCKER_PASSWORD}" ]]; then
-            echo "DOCKER_USER and DOCKER_PASSWORD are required for a release" >&2
-            exit 1
-          fi
-          if [[ "${DOCKER_USER}" != "${GITHUB_REPOSITORY_OWNER}" ]]; then
-            echo "DOCKER_USER must exactly match github.repository_owner" >&2
-            exit 1
-          fi
+          echo "namespace=${GITHUB_REPOSITORY_OWNER,,}" >>"${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Update latest only after the stable release is complete
         env:
           IMAGE_TAG: ${{ needs.validate-release.outputs.version }}
-          REGISTRY_NAMESPACE: ${{ github.repository_owner }}
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
         run: |
-          for image in builder kadalu-csi kadalu-operator kadalu-server; do
-            versioned="docker.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}"
+          for image in kadalu-builder kadalu-csi kadalu-operator kadalu-server; do
+            versioned="ghcr.io/${REGISTRY_NAMESPACE}/${image}:${IMAGE_TAG}"
             docker buildx imagetools inspect "${versioned}" >/dev/null
             docker buildx imagetools create \
-              --tag "docker.io/${REGISTRY_NAMESPACE}/${image}:latest" \
+              --tag "ghcr.io/${REGISTRY_NAMESPACE}/${image}:latest" \
               "${versioned}"
+          done
+
+      - name: Verify latest images are anonymously pullable
+        env:
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
+        run: |
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf -- "${anonymous_config}"' EXIT
+          for image in kadalu-builder kadalu-csi kadalu-operator kadalu-server; do
+            DOCKER_CONFIG="${anonymous_config}" docker manifest inspect \
+              "ghcr.io/${REGISTRY_NAMESPACE}/${image}:latest" >/dev/null
           done

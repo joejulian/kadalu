@@ -51,6 +51,13 @@ def test_operator_reads_configmap_from_configured_namespace(monkeypatch):
     ]]
 
 
+def test_operator_defaults_to_fork_registry(monkeypatch):
+    monkeypatch.delenv("IMAGES_HUB", raising=False)
+    main = _load_module(monkeypatch, "kadalu_operator.main")
+
+    assert main.IMAGES_HUB == "ghcr.io"
+
+
 def test_operator_stops_delete_when_metadata_is_unavailable(monkeypatch):
     main = _load_module(monkeypatch, "kadalu_operator.main")
     monkeypatch.setattr(main, "get_configmap_data", lambda _name: None)

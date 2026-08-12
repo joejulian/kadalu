@@ -1,7 +1,5 @@
 # kaDalu
 
-[![Operator Docker Pulls](https://img.shields.io/docker/pulls/kadalu/kadalu-operator.svg?label=DockerPulls%20Operator)](https://img.shields.io/docker/pulls/kadalu/kadalu-operator.svg)
-[![Server Docker Pulls](https://img.shields.io/docker/pulls/kadalu/kadalu-server.svg?label=DockerPulls%20Server)](https://img.shields.io/docker/pulls/kadalu/kadalu-server.svg)
 ![Devel](https://github.com/joejulian/kadalu/actions/workflows/on-pr-merge.yml/badge.svg)
 ![Release](https://github.com/joejulian/kadalu/actions/workflows/on-release-tag.yml/badge.svg)
 

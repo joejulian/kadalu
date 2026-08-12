@@ -448,7 +448,7 @@ spec:
                 - ALL
             privileged: false
             readOnlyRootFilesystem: true
-          image: docker.io/joejulian/kadalu-operator:devel
+          image: ghcr.io/joejulian/kadalu-operator:devel
           imagePullPolicy: IfNotPresent
           env:
             - name: WATCH_NAMESPACE
@@ -462,7 +462,7 @@ spec:
             - name: OPERATOR_NAME
               value: "kadalu-operator"
             - name: IMAGES_HUB
-              value: "docker.io"
+              value: "ghcr.io"
             - name: DOCKER_USER
               value: "joejulian"
             - name: CSI_SIDECAR_REGISTRY

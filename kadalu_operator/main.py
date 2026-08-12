@@ -25,7 +25,7 @@ from utils import execute as utils_execute
 NAMESPACE = os.environ.get("KADALU_NAMESPACE", "kadalu")
 VERSION = os.environ.get("KADALU_VERSION", "latest")
 K8S_DIST = os.environ.get("K8S_DIST", "kubernetes")
-IMAGES_HUB = os.environ.get("IMAGES_HUB", "docker.io")
+IMAGES_HUB = os.environ.get("IMAGES_HUB", "ghcr.io")
 CSI_SIDECAR_REGISTRY = os.environ.get(
     "CSI_SIDECAR_REGISTRY", "registry.k8s.io"
 )
