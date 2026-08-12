@@ -3,5 +3,5 @@ name: common
 icon: https://kadalu.io/static/css/logo.png
 description: kdalu.io Common Chart
 type: library
-# Value of 'version' will be replaced with correct version on part of release
-version: 0.0.0-0
+# Development placeholder replaced during release packaging.
+version: 0.0.0-dev.0

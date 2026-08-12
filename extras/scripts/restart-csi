@@ -1,2 +1,7 @@
 #!/bin/bash
-kubectl get pods -nkadalu | grep "csi-" | awk '{print $1}' | xargs kubectl delete pod -nkadalu
+set -euo pipefail
+
+KADALU_NAMESPACE=${KADALU_NAMESPACE:-kadalu}
+kubectl get pods -n "${KADALU_NAMESPACE}" -o name \
+  | awk '/-csi-/' \
+  | xargs -r kubectl delete -n "${KADALU_NAMESPACE}"

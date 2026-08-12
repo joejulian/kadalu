@@ -1,31 +1,58 @@
 #!/bin/bash
 
-kubectl -nkadalu delete StatefulSet kadalu-csi-provisioner
-kubectl -nkadalu delete ClusterRoleBinding kadalu-csi-provisioner
-kubectl -nkadalu delete ServiceAccount kadalu-csi-provisioner
-kubectl -nkadalu delete ClusterRole kadalu-csi-provisioner
-kubectl -nkadalu delete Role kadalu-csi-provisioner
-kubectl -nkadalu delete RoleBinding kadalu-csi-provisioner
+set -euo pipefail
 
-kubectl -nkadalu delete DaemonSet kadalu-csi-nodeplugin
-kubectl -nkadalu delete ClusterRoleBinding kadalu-csi-nodeplugin
-kubectl -nkadalu delete ClusterRole kadalu-csi-nodeplugin
-kubectl -nkadalu delete ServiceAccount kadalu-csi-nodeplugin
+KADALU_NAMESPACE=${KADALU_NAMESPACE:-kadalu}
+KADALU_SELECTOR='app.kubernetes.io/part-of=kadalu'
 
-kubectl delete CSIDriver kadalu
-kubectl get Service -nkadalu | awk '{print $1}' | xargs kubectl -nkadalu delete Service
-kubectl get StatefulSet -nkadalu | awk '{print $1}' | xargs kubectl -nkadalu delete StatefulSet
-kubectl get storageclass | grep kadalu | awk '{print $1}' | xargs kubectl delete storageclass
+kubectl delete daemonset,statefulset,deployment,service \
+  -l "${KADALU_SELECTOR}" -n "${KADALU_NAMESPACE}" --ignore-not-found
+kubectl delete serviceaccount \
+  kadalu-csi-provisioner kadalu-csi-nodeplugin kadalu-operator kadalu-server-sa \
+  -n "${KADALU_NAMESPACE}" --ignore-not-found
+kubectl delete role \
+  kadalu-operator kadalu-csi-leader-election kadalu-csi-provisioner \
+  -n "${KADALU_NAMESPACE}" --ignore-not-found
+kubectl delete rolebinding \
+  kadalu-operator kadalu-csi-leader-election kadalu-csi-provisioner \
+  -n "${KADALU_NAMESPACE}" --ignore-not-found
+kubectl delete configmap kadalu-info \
+  -n "${KADALU_NAMESPACE}" --ignore-not-found
 
-# Operator
-kubectl delete -nkadalu CustomResourceDefinition kadalustorages.kadalu-operator.storage
-kubectl delete -nkadalu ClusterRole pod-exec
-kubectl delete -nkadalu ClusterRole kadalu-operator
-kubectl delete -nkadalu ServiceAccount kadalu-operator
-kubectl delete -nkadalu ClusterRoleBinding kadalu-operator
-kubectl delete -nkadalu Deployment kadalu-operator
+kubectl get storageclass -o name \
+  | awk '/^storageclass.storage.k8s.io\/kadalu\./' \
+  | xargs -r kubectl delete
 
-# CSIDriver
-kubectl delete CSIDriver kadalu
+kubectl delete csidriver kadalu --ignore-not-found
+kubectl delete customresourcedefinition \
+  kadalustorages.kadalu-operator.storage --ignore-not-found
+kubectl delete clusterrole \
+  kadalu-operator \
+  kadalu-csi-external-attacher \
+  kadalu-csi-external-provisioner \
+  kadalu-csi-external-resizer \
+  kadalu-csi-nodeplugin \
+  kadalu-csi-provisioner \
+  pod-exec \
+  --ignore-not-found
+kubectl delete clusterrolebinding \
+  kadalu-operator \
+  kadalu-csi-external-attacher \
+  kadalu-csi-external-provisioner \
+  kadalu-csi-external-resizer \
+  kadalu-csi-nodeplugin \
+  kadalu-csi-provisioner \
+  --ignore-not-found
 
-kubectl delete namespace kadalu
+if kubectl api-resources --api-group=security.openshift.io -o name \
+  | awk '$0 == "securitycontextconstraints.security.openshift.io" { found=1 } END { exit !found }'; then
+  kubectl delete securitycontextconstraints.security.openshift.io \
+    kadalu-scc --ignore-not-found
+fi
+
+if [[ "${KADALU_DELETE_NAMESPACE:-false}" == "true" ]]; then
+  kubectl delete namespace "${KADALU_NAMESPACE}" --ignore-not-found
+else
+  echo "Preserved namespace ${KADALU_NAMESPACE}." \
+    "Set KADALU_DELETE_NAMESPACE=true to delete it."
+fi

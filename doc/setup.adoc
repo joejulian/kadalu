@@ -2,26 +2,28 @@
 
 == Pre-Requisites
 
-- Kubernetes 1.13.0 + version
+- https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/[Kubernetes
+  1.36]. This fork uses Kubernetes 1.36 as its current compatibility-validation
+  target. Older Kubernetes releases may work, but they are not covered by the
+  current validation gate.
 - The host should support xfs (`mkfs.xfs`) with the superblock v5 format
   - On some systems this might require installation of xfsprogs package
 
+For source development and test tooling, use Python 3.12 and install
+dependencies from the locked requirement files in the repository.
+
 == Setup
 
-=== Krew based installation
-
-[source,console]
-----
-$ kubectl krew install kadalu
-----
-
 === Binary based installation
+
+The public Krew entry currently installs upstream Kadalu, not this fork. Use
+the fork's release assets directly:
 
 Download and install the latest release of Kadalu Kubectl plugin using,
 
 [source,console]
 ----
-$ curl -fsSL https://github.com/kadalu/kadalu/releases/latest/download/install.sh | sudo bash -x
+$ curl -fsSL https://github.com/joejulian/kadalu/releases/latest/download/install.sh | sudo bash -x
 ----
 
 Test to ensure the version you installed is up-to-date

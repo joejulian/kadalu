@@ -3,18 +3,49 @@ nodeserver implementation
 """
 import logging
 import os
+import re
 import time
 
 import csi_pb2
 import csi_pb2_grpc
 import grpc
-from kadalulib import logf, execute
+from kadalulib import logf
 from volumeutils import mount_glusterfs, unmount_glusterfs, mount_volume, unmount_volume
 
 HOSTVOL_MOUNTDIR = "/mnt"
-GLUSTERFS_CMD = "/opt/sbin/glusterfs"
-MOUNT_CMD = "/bin/mount"
-UNMOUNT_CMD = "/bin/umount"
+MOUNTS_FILE = "/proc/mounts"
+
+
+def _unescape_mount_field(value):
+    """Decode the octal escapes used in /proc/mounts fields."""
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _read_gluster_mounts():
+    """Return Gluster mount source and target pairs without invoking a shell."""
+    mounts = []
+    with open(MOUNTS_FILE, encoding="utf-8") as mounts_file:
+        for line in mounts_file:
+            fields = line.split()
+            if len(fields) < 3 or fields[2] != "fuse.glusterfs":
+                continue
+            mounts.append((
+                _unescape_mount_field(fields[0]),
+                _unescape_mount_field(fields[1]),
+            ))
+    return mounts
+
+
+def _gluster_volume_name(source):
+    """Extract the volume name from a Gluster mount source."""
+    _, separator, remote_path = source.rpartition(":")
+    if not separator:
+        return None
+    return remote_path.lstrip("/").split("/", maxsplit=1)[0] or None
 
 # noqa # pylint: disable=too-many-locals
 # noqa # pylint: disable=too-many-statements
@@ -143,44 +174,39 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
             request=request,
         ))
 
-        # Get the gluster volumename for a PVC volume ID
-        cmd = (
-            r'grep %s /proc/mounts '
-            r'| head -n 1 '
-            r'| cut -f 1 -d " " '
-            r'| cut -f 2 -d ":"' % (request.volume_id)
-        )
-
-        gvolname, _, _ = execute(cmd,shell=True)
+        mounts = _read_gluster_mounts()
+        source = next((
+            mount_source
+            for mount_source, target in mounts
+            if target == request.target_path
+        ), None)
+        gvolname = _gluster_volume_name(source) if source else None
 
         logging.debug(logf(
-            "Got gluster volume name %s" % gvolname
+            f"Got gluster volume name {gvolname}"
         ))
 
         unmount_volume(request.target_path)
 
-        # Count remaining mounts
-        cmd = (
-            r'grep "fuse.glusterfs" /proc/mounts '
-            r'| grep ":%s " '
-            r'| wc -l' % (gvolname)
-        )
+        if gvolname is None:
+            return csi_pb2.NodeUnpublishVolumeResponse()
 
-        count, _, _ = execute(cmd,shell=True)
+        remaining_mounts = [
+            (mount_source, target)
+            for mount_source, target in _read_gluster_mounts()
+            if _gluster_volume_name(mount_source) == gvolname
+        ]
 
-        # If only PV mount is left, unmount this too
-        if int(count) == 1:
-            cmd = (
-                r'grep %s /proc/mounts '
-                r'| cut -f 2 -d " "' % (gvolname)
-            )
-
-            mntdir, _, _ = execute(cmd,shell=True)
+        # If only the hosting-volume mount remains, unmount it too.
+        if len(remaining_mounts) == 1:
+            _, mntdir = remaining_mounts[0]
+            if os.path.dirname(mntdir) != HOSTVOL_MOUNTDIR:
+                return csi_pb2.NodeUnpublishVolumeResponse()
             logging.debug(logf(
-                "Only one mount left, going to unmount %s" % mntdir
+                f"Only one mount left, going to unmount {mntdir}"
             ))
 
-            unmount_glusterfs(mntdir,gvolname)
+            unmount_glusterfs(mntdir, gvolname)
 
         return csi_pb2.NodeUnpublishVolumeResponse()
 

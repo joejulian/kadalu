@@ -274,7 +274,8 @@ def storage_add_data(args):
         "apiVersion": "kadalu-operator.storage/v1alpha1",
         "kind": "KadaluStorage",
         "metadata": {
-            "name": args.name
+            "name": args.name,
+            "namespace": args.namespace
         },
         "spec": {
             "type": args.type,
@@ -374,7 +375,9 @@ def run(args):
         with os.fdopen(config, 'w') as tmp:
             tmp.write(yaml_content)
 
-        cmd = utils.kubectl_cmd(args) + ["apply", "-f", tempfile_path]
+        cmd = utils.namespaced_kubectl_cmd(args) + [
+            "apply", "-f", tempfile_path
+        ]
         resp = utils.execute(cmd)
         print("Storage add request sent successfully")
         print(resp.stdout)

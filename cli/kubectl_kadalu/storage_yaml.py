@@ -7,7 +7,7 @@ YAML_TEMPLATE = """apiVersion: "kadalu-operator.storage/v1alpha1"
 kind: "KadaluStorage"
 metadata:
   name: "${name}"
-spec:
+${namespace}spec:
   type: "${type}"
   storage:"""
 
@@ -37,8 +37,15 @@ TIEBREAKER_TMPL = """  tiebreaker:
 # noqa # pylint: disable=too-many-branches
 def to_storage_yaml(data):
     """Convert Python dict to yaml format"""
-    yaml = Template(YAML_TEMPLATE).substitute(name=data["metadata"]["name"],
-                                              type=data["spec"]["type"])
+    namespace = ""
+    if data["metadata"].get("namespace") is not None:
+        namespace = '  namespace: "%s"\n' % data["metadata"]["namespace"]
+
+    yaml = Template(YAML_TEMPLATE).substitute(
+        name=data["metadata"]["name"],
+        namespace=namespace,
+        type=data["spec"]["type"],
+    )
 
     if len(data["spec"].get("storage", [])) == 0:
         yaml += " []\n"

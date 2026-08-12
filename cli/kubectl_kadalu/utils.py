@@ -2,11 +2,15 @@
 Utility methods for the CLI tool
 """
 from __future__ import print_function
+import argparse
 import subprocess
 import json
+import re
 import sys
 
 KUBECTL_CMD = "kubectl"
+DEFAULT_NAMESPACE = "kadalu"
+NAMESPACE_RE = re.compile(r"^[a-z0-9](?:[-a-z0-9]*[a-z0-9])?$")
 
 # noqa # pylint: disable=too-many-instance-attributes
 # noqa # pylint: disable=useless-object-inheritance
@@ -96,18 +100,44 @@ def execute(cmd):
         raise CommandError(proc.returncode, err)
 
 
-def add_global_flags(parser):
+def validate_namespace(namespace):
+    """Validate a Kubernetes namespace name."""
+    if len(namespace) > 63 or not NAMESPACE_RE.fullmatch(namespace):
+        raise argparse.ArgumentTypeError(
+            "namespace must be a lowercase RFC 1123 label of at most 63 characters"
+        )
+
+    return namespace
+
+
+def add_global_flags(parser, suppress_defaults=True):
     """Global Flags available with every subcommand"""
-    parser.add_argument("--kubectl-cmd", default=KUBECTL_CMD,
+    def flag_default(value):
+        if suppress_defaults:
+            return argparse.SUPPRESS
+        return value
+
+    parser.add_argument("--kubectl-cmd", default=flag_default(KUBECTL_CMD),
                         help="Kubectl Command Path")
     parser.add_argument("--verbose", action="store_true",
+                        default=flag_default(False),
                         help="Verbose output")
     parser.add_argument("--dry-run", action="store_true",
+                        default=flag_default(False),
                         help="Skip execution only preview")
     parser.add_argument("--script-mode", action="store_true",
+                        default=flag_default(False),
                         help="Script mode, bypass Prompts")
-    parser.add_argument("--kubectl-context", default=None,
+    parser.add_argument("--kubectl-context", default=flag_default(None),
                         help="Kubectl Context")
+    parser.add_argument(
+        "-n",
+        "--namespace",
+        default=flag_default(DEFAULT_NAMESPACE),
+        metavar="NAMESPACE",
+        type=validate_namespace,
+        help="Namespace for Kadalu resources (default: kadalu)",
+    )
 
 
 def command_error(cmd, msg):
@@ -136,3 +166,8 @@ def kubectl_cmd(args):
     if args.kubectl_context is not None:
         cmd_args += ["--context", args.kubectl_context]
     return cmd_args
+
+
+def namespaced_kubectl_cmd(args):
+    """Build a kubectl command explicitly scoped to the Kadalu namespace."""
+    return kubectl_cmd(args) + ["--namespace", args.namespace]

@@ -20,11 +20,22 @@ spec:
         prometheus.io/port: "8050"
     spec:
       serviceAccountName: kadalu-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: kadalu-operator
           securityContext:
-            capabilities: {}
-            privileged: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            privileged: false
+            readOnlyRootFilesystem: true
           image: {{ include "common.images.image" . }}/kadalu-operator:{{ include "common.version" . }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
           env:
@@ -42,6 +53,8 @@ spec:
               value: {{ .Values.global.image.registry | quote }}
             - name: DOCKER_USER
               value: {{ .Values.global.image.repository | quote }}
+            - name: CSI_SIDECAR_REGISTRY
+              value: {{ .Values.global.csiSidecarRegistry | quote }}
             - name: KADALU_VERSION
               value: {{ include "common.version" . | quote }}
             - name: KADALU_NAMESPACE
@@ -52,3 +65,9 @@ spec:
               value: {{ .Values.global.kubernetesDistro | quote }}
             - name: VERBOSE
               value: {{ .Values.verbose | quote }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

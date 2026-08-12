@@ -1,6 +1,7 @@
-ARG builder_version="latest"
+ARG builder_image="ghcr.io/joejulian/kadalu-builder:devel"
+ARG python_image="python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2"
 
-FROM kadalu/builder:${builder_version} as builder
+FROM ${builder_image} AS builder
 
 ENV PATH="/kadalu/bin:/opt/bin:/opt/sbin:$PATH"
 
@@ -11,10 +12,27 @@ RUN python3 -m pip install $(grep -vE '^(grpcio|\s*#)' /tmp/csi-requirements.txt
     python3 -m pip install /tmp/*.whl --force-reinstall && \
     grep -Po '^[\w\.-]*(?=)' /tmp/csi-requirements.txt | xargs -I pkg python3 -m pip show pkg | grep -P '^(Name|Version|Location)'
 
-FROM python:3.10-slim-bullseye as prod
+FROM ${python_image} AS prod
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -yq && \
-    apt-get install -y --no-install-recommends sqlite3 psmisc logrotate xfsprogs attr libtirpc3 bash inotify-tools ssh liburcu6 libgoogle-perftools4 tini && \
+    apt-get install -y --no-install-recommends \
+        attr \
+        bash \
+        inotify-tools \
+        libacl1 \
+        libgoogle-perftools4 \
+        libssl3 \
+        libtirpc3 \
+        liburcu8 \
+        libuuid1 \
+        libxml2 \
+        logrotate \
+        psmisc \
+        sqlite3 \
+        ssh \
+        tini \
+        xfsprogs \
+        zlib1g && \
     apt-get -y clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -27,8 +45,7 @@ COPY --from=builder /opt /opt
 # using already installed packages from builder for faster build time
 COPY --from=builder /kadalu /kadalu
 
-# venv in 'buster' img links python3 executable to '/usr/bin/python3'
-# but in 'python:slim' it's at '/usr/local/bin/python3'
+# Keep the copied virtual environment linked to this image's Python runtime.
 RUN ln -sfn /usr/local/bin/python3 /kadalu/bin/python3
 
 RUN mkdir -p /kadalu/volfiles /kadalu/templates
@@ -59,15 +76,19 @@ RUN chmod +x /kadalu/client_heal.sh
 ARG version="(unknown)"
 # Container build time (date -u '+%Y-%m-%dT%H:%M:%S.%NZ')
 ARG builddate="(unknown)"
+ARG revision="(unknown)"
+ARG source="https://github.com/joejulian/kadalu"
 
 LABEL build-date="${builddate}"
 LABEL io.k8s.description="KaDalu CSI driver"
 LABEL name="kadalu-csi"
 LABEL Summary="KaDalu CSI driver"
 LABEL vcs-type="git"
-LABEL vcs-url="https://github.com/kadalu/kadalu"
+LABEL vcs-url="https://github.com/joejulian/kadalu"
 LABEL vendor="kadalu"
 LABEL version="${version}"
+LABEL org.opencontainers.image.revision="${revision}"
+LABEL org.opencontainers.image.source="${source}"
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "/kadalu/start.py"]

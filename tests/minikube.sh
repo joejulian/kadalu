@@ -212,7 +212,16 @@ function install_minikube() {
   fi
 
   echo "Installing minikube. Version: ${MINIKUBE_VERSION}"
-  curl -Lo minikube https://storage.googleapis.com/minikube/releases/"${MINIKUBE_VERSION}"/minikube-linux-${ARCH} && chmod +x minikube && mv minikube /usr/local/bin/
+  local checksum
+  case "${ARCH}" in
+    amd64) checksum="099477eaf248bcb5bcea8ce78a2898e93ac01461c35189da1848c3de82ecd22e" ;;
+    arm64) checksum="a0b8a1ebfc8c07a247271d8df98ac0ddd7c8c855b601d402463e2e50c08c6bab" ;;
+    *) echo "Unsupported minikube architecture: ${ARCH}" >&2; return 1 ;;
+  esac
+  curl -fLo minikube "https://github.com/kubernetes/minikube/releases/download/${MINIKUBE_VERSION}/minikube-linux-${ARCH}"
+  echo "${checksum}  minikube" | sha256sum -c -
+  chmod +x minikube
+  mv minikube /usr/local/bin/
 }
 
 function install_kubectl() {
@@ -228,7 +237,16 @@ function install_kubectl() {
   fi
   # Download kubectl, which is a requirement for using minikube.
   echo "Installing kubectl. Version: ${KUBE_VERSION}"
-  curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/"${KUBE_VERSION}"/bin/linux/${ARCH}/kubectl && chmod +x kubectl && mv kubectl /usr/local/bin/
+  local checksum
+  case "${ARCH}" in
+    amd64) checksum="ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336" ;;
+    arm64) checksum="3d86f24401c41ae5a46ac50eef8865fe891d3647d324a0836f6c63757a126e62" ;;
+    *) echo "Unsupported kubectl architecture: ${ARCH}" >&2; return 1 ;;
+  esac
+  curl -fLo kubectl "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/${ARCH}/kubectl"
+  echo "${checksum}  kubectl" | sha256sum -c -
+  chmod +x kubectl
+  mv kubectl /usr/local/bin/
 }
 
 function run_io() {
@@ -329,8 +347,8 @@ function deploy_kadalu_resources() {
 
   # Prepare PVC also as a storage
   sed -i -e "s/DISK/${DISK}/g" tests/get-minikube-pvc.yaml
-  kubectl apply -f tests/get-minikube-pvc.yaml
-  kubectl apply -f /tmp/kadalu-storage.yaml
+  kubectl apply -n kadalu -f tests/get-minikube-pvc.yaml
+  kubectl apply -n kadalu -f /tmp/kadalu-storage.yaml
 
 }
 
@@ -363,21 +381,22 @@ function modify_pool() {
   sed -i -e "s/DISK/${DISK}/g" /tmp/kadalu-storage.yaml
   sed -i -e "s/node: minikube/node: ${HOSTNAME}/g" /tmp/kadalu-storage.yaml
   sed -i -e "s/dir3.2/dir3.2_modified/g" /tmp/kadalu-storage.yaml
-  kubectl apply -f /tmp/kadalu-storage.yaml
+  kubectl apply -n kadalu -f /tmp/kadalu-storage.yaml
 }
 
 # configure minikube
-MINIKUBE_VERSION=${MINIKUBE_VERSION:-"v1.15.1"}
-KUBE_VERSION=${KUBE_VERSION:-"v1.20.0"}
+MINIKUBE_VERSION=${MINIKUBE_VERSION:-"v1.38.1"}
+KUBE_VERSION=${KUBE_VERSION:-"v1.36.3"}
 COMMIT_MSG=${COMMIT_MSG:-""}
 MEMORY=${MEMORY:-"3000"}
 VM_DRIVER=${VM_DRIVER:-"none"}
 # configure image repo
-KADALU_IMAGE_REPO=${KADALU_IMAGE_REPO:-"docker.io/kadalu"}
+KADALU_BUILD_IMAGE_REPO=${KADALU_BUILD_IMAGE_REPO:-"joejulian"}
+KADALU_IMAGE_REPO=${KADALU_IMAGE_REPO:-"ghcr.io/joejulian"}
 K8S_IMAGE_REPO=${K8S_IMAGE_REPO:-"quay.io/k8scsi"}
 
 # feature-gates for kube
-K8S_FEATURE_GATES=${K8S_FEATURE_GATES:-"BlockVolume=true,CSIBlockVolume=true,VolumeSnapshotDataSource=true,CSIDriverRegistry=true"}
+K8S_FEATURE_GATES=${K8S_FEATURE_GATES:-""}
 
 DISK="sda1"
 if [[ "${VM_DRIVER}" == "kvm2" ]]; then
@@ -396,7 +415,17 @@ case "${1:-}" in
     fi
 
     echo "starting minikube with kubeadm bootstrapper"
-    minikube start --memory="${MEMORY}" -b kubeadm --kubernetes-version="${KUBE_VERSION}" --vm-driver="${VM_DRIVER}" --feature-gates="${K8S_FEATURE_GATES}"
+    minikube_args=(
+      start
+      --memory="${MEMORY}"
+      --bootstrapper=kubeadm
+      --kubernetes-version="${KUBE_VERSION}"
+      --driver="${VM_DRIVER}"
+    )
+    if [[ -n "${K8S_FEATURE_GATES}" ]]; then
+      minikube_args+=(--feature-gates="${K8S_FEATURE_GATES}")
+    fi
+    minikube "${minikube_args[@]}"
 
     # environment
     if [[ "${VM_DRIVER}" != "none" ]]; then
@@ -420,7 +449,7 @@ case "${1:-}" in
     ;;
   copy-image)
     echo "copying the kadalu-operator image"
-    copy_image_to_cluster kadalu/kadalu-operator:${KADALU_VERSION} "${KADALU_IMAGE_REPO}"/kadalu-operator:${KADALU_VERSION}
+    copy_image_to_cluster "${KADALU_BUILD_IMAGE_REPO}/kadalu-operator:${KADALU_VERSION}" "${KADALU_IMAGE_REPO}/kadalu-operator:${KADALU_VERSION}"
     ;;
   ssh)
     echo "connecting to minikube"

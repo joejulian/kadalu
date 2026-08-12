@@ -5,7 +5,7 @@
 Download the latest release with the command
 
 ```
-curl -LO https://github.com/kadalu/kadalu/releases/download/0.8.0/kubectl-kadalu
+curl -LO https://github.com/joejulian/kadalu/releases/latest/download/kubectl-kadalu
 ```
 
 Make the kubectl binary executable.
@@ -27,6 +27,19 @@ $ kubectl-kadalu version
 ```
 
 ## Usage:
+
+### Use a custom namespace
+
+Kadalu uses the `kadalu` namespace by default. Select another namespace with
+`-n` or `--namespace`; the flag can appear before or after the subcommand.
+
+```
+$ kubectl kadalu -n ocean-eleven install
+$ kubectl kadalu storage-list --namespace ocean-eleven
+```
+
+Use the same namespace flag for later commands so that the plugin never falls
+back to the current namespace in your kubeconfig.
 
 ### Add Storage
 
@@ -191,4 +204,3 @@ $ kubectl kadalu option-reset storage-pool1 --all
 5. Commit your changes (`git commit -am 'Add some feature'`)
 4. Push to the branch (`git push origin my-new-feature`)
 5. Create a new Pull Request
-

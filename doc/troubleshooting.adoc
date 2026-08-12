@@ -2,39 +2,32 @@
 
 This page is a collection for some common problems and their solution
 
-== not all pods are started - `error when creating "/kadalu/templates/csi-driver-object.yaml"`
+== CSI pods do not start
 
-Kadalu-operator spins up several pods like `csi-provisioner` or `csi-nodeplugin`. In case you don't see them expect the `operator`-pod check the log of the pod.
+The Kadalu operator applies the CSI controller and node resources after it
+starts. If only the `operator` pod is present, inspect its logs and Kubernetes
+events before deleting or restarting anything:
 
 [source,console]
 ----
 $ kubectl get pods -n kadalu
 NAME                        READY   STATUS    RESTARTS   AGE
 operator-68649f4bb6-zq7fp   1/1     Running   0          126m
+$ kubectl logs -n kadalu deployment/operator
+$ kubectl get events -n kadalu --sort-by=.lastTimestamp
 ----
 
-----
-...
-Traceback (most recent call last):
-  File "/kadalu/main.py", line 475, in <module>
-    main()
-  File "/kadalu/main.py", line 458, in main
-    deploy_csi_pods(core_v1_client)
-  File "/kadalu/main.py", line 394, in deploy_csi_pods
-    execute(KUBECTL_CMD, CREATE_CMD, "-f", filename)
-  File "/kadalu/kadalulib.py", line 60, in execute
-    raise CommandException(proc.returncode, out.strip(), err.strip())
-kadalulib.CommandException: [1] b'' b'Error from server (AlreadyExists): error when creating "/kadalu/templates/csi-driver-object.yaml": csidrivers.storage.k8s.io "kadalu" already exists'
-----
-
-If the log complains about ` error when creating "/kadalu/templates/csi-driver-object.yaml"` you might delete the `CSIDriver` as follows
+Confirm that the stable CSI registration object and workloads were applied:
 
 [source,console]
 ----
-$ kubectl delete CSIDriver kadalu
+$ kubectl get csidriver kadalu
+$ kubectl get daemonset,statefulset -n kadalu -l app.kubernetes.io/part-of=kadalu
 ----
 
-> **Note**: Use the https://github.com/kadalu/kadalu/blob/devel/extras/scripts/cleanup[cleanup script] to properly cleanup kadalu.
+The operator uses idempotent declarative apply, so an existing `CSIDriver`
+normally should not be deleted. Resolve the concrete authorization, validation,
+or image-pull error shown in the logs or events instead.
 
 == Storage cannot be created - `Failed to create file system	 fstype=xfs device=/dev/md3`
 
@@ -168,4 +161,16 @@ Events:
   Warning  FailedMount             11s (x13 over 10m)  kubelet                  MountVolume.MountDevice failed for volume "pvc-a047ee57-d5b3-4f37-a217-995e26d2f066" : kubernetes.io/csi: attacher.MountDevice failed to create newCsiDriverClient: driver name kadalu not found in the list of registered CSI drivers
 ----
 
-Reapply the csi-nodeplugin-`platform`.yaml manifest from https://github.com/kadalu/kadalu/releases/latest[Kadalu Latest Release]
+Reapply the appropriate operator manifest from the
+https://github.com/joejulian/kadalu/releases/latest[latest fork release], then
+restart the operator so it reconciles the CSI workloads. Verify that the
+`kadalu-csi-nodeplugin` DaemonSet is available on the affected node before
+retrying the workload.
+
+[source,console]
+----
+kubectl apply -f kadalu-operator.yaml
+kubectl -n kadalu rollout restart deployment/operator
+kubectl -n kadalu rollout status deployment/operator
+kubectl -n kadalu get daemonset/kadalu-csi-nodeplugin
+----

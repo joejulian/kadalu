@@ -18,6 +18,8 @@ spec:
       app.kubernetes.io/component: csi-driver
       app.kubernetes.io/name: kadalu-csi-nodeplugin
   updateStrategy:
+    # Replacing this pod terminates its Gluster FUSE clients. Keep upgrades
+    # explicitly node-by-node until mount handoff is proven safe.
     type: OnDelete
   template:
     metadata:
@@ -30,15 +32,24 @@ spec:
       serviceAccountName: kadalu-csi-nodeplugin
       containers:
         - name: csi-node-driver-registrar
-          image: {{ images_hub }}/raspbernetes/csi-node-driver-registrar:2.0.1
+          image: {{ csi_sidecar_registry }}/sig-storage/csi-node-driver-registrar:v2.17.0@sha256:f9de845b170155199f2a2a3f9531cf13d78e31235e9db6b6582a8b0db0a50dad
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
             - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "rm -rf /registration/kadalu /registration/kadalu-reg.sock"]
+            - "--http-endpoint=:9807"
+          ports:
+            - name: registrar-hlth
+              containerPort: 9807
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: registrar-hlth
+            initialDelaySeconds: 30
+            timeoutSeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
           env:
             - name: ADDRESS
               value: /plugin/csi.sock
@@ -108,8 +119,26 @@ spec:
             - name: csi-dir
               mountPath: {{ kubelet_dir }}/plugins/kubernetes.io/csi
               mountPropagation: "Bidirectional"
+        - name: csi-liveness-probe
+          image: {{ csi_sidecar_registry }}/sig-storage/livenessprobe:v2.19.0@sha256:06da0d5b8908072f2e4522692aee8dc119fba7247a9658497e1153992cd777e9
+          args:
+            - "--csi-address=/plugin/csi.sock"
+            - "--http-endpoint=:9808"
+          # This is deliberately readiness-only. Restarting the node driver
+          # would also kill every Gluster FUSE client that it owns.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9808
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /plugin
         - name: kadalu-logging
-          image: {{ images_hub }}/library/busybox
+          image: {{ images_hub }}/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
           args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -f /var/log/gluster/*.log"]
@@ -173,10 +202,24 @@ spec:
       serviceAccountName: kadalu-csi-provisioner
       containers:
         - name: csi-provisioner
-          image: {{ images_hub }}/raspbernetes/csi-external-provisioner:2.0.2
+          image: {{ csi_sidecar_registry }}/sig-storage/csi-provisioner:v6.3.0@sha256:a4b0b1a37605b7b04a293e136edf7006ec1786a8eb3f4e5a945f81d667dcc371
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
+            - "--leader-election"
+            - "--http-endpoint=:9808"
+          ports:
+            - name: provision-hlth
+              containerPort: 9808
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz/leader-election
+              port: provision-hlth
+            initialDelaySeconds: 10
+            timeoutSeconds: 10
+            periodSeconds: 20
+            failureThreshold: 1
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -189,21 +232,6 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
-        - name: csi-attacher
-          image: {{ images_hub }}/raspbernetes/csi-external-attacher:3.0.0
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-          env:
-            - name: ADDRESS
-              value: /var/lib/csi/sockets/pluginproxy/csi.sock
-            - name: KADALU_VERSION
-              value: "{{ kadalu_version }}"
-            - name: K8S_DIST
-              value: "{{ k8s_dist }}"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: kadalu-provisioner
           securityContext:
             privileged: true
@@ -211,6 +239,18 @@ spec:
               add: ["CAP_SYS_ADMIN", "SYS_ADMIN"]
             allowPrivilegeEscalation: true
           image: {{ images_hub }}/{{ docker_user }}/kadalu-csi:{{ kadalu_version }}
+          ports:
+            - name: driver-health
+              containerPort: 9809
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: driver-health
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 5
           env:
             - name: NODE_ID
               valueFrom:
@@ -245,7 +285,7 @@ spec:
               readOnly: true
               mountPath: "/etc/secret-volume"
         - name: kadalu-logging
-          image: {{ images_hub }}/library/busybox
+          image: {{ images_hub }}/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
           args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -F /var/log/gluster/*.log"]
@@ -253,10 +293,24 @@ spec:
             - name: varlog
               mountPath: "/var/log/gluster"
         - name: csi-resizer
-          image: {{ images_hub }}/raspbernetes/csi-external-resizer:1.0.0
+          image: {{ csi_sidecar_registry }}/sig-storage/csi-resizer:v2.2.1@sha256:ea1d25e23479000c7e8eeb92d827df66258df4e482ca054c5e7ce3fc0f5c41a5
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
+            - "--leader-election"
+            - "--http-endpoint=:9810"
+          ports:
+            - name: resizer-health
+              containerPort: 9810
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz/leader-election
+              port: resizer-health
+            initialDelaySeconds: 10
+            timeoutSeconds: 10
+            periodSeconds: 20
+            failureThreshold: 1
           env:
             - name: ADDRESS
               value: /var/lib/csi/sockets/pluginproxy/csi.sock
@@ -269,6 +323,14 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
+        - name: csi-liveness-probe
+          image: {{ csi_sidecar_registry }}/sig-storage/livenessprobe:v2.19.0@sha256:06da0d5b8908072f2e4522692aee8dc119fba7247a9658497e1153992cd777e9
+          args:
+            - "--csi-address=/plugin/csi.sock"
+            - "--http-endpoint=:9809"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /plugin
       volumes:
         - name: socket-dir
           emptyDir:

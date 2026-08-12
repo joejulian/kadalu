@@ -15,11 +15,13 @@ from kadalulib import (PV_TYPE_RAWBLOCK, PV_TYPE_SUBVOL, PV_TYPE_VIRTBLOCK,
                        send_analytics_tracker, get_single_pv_per_pool)
 from volumeutils import (HOSTVOL_MOUNTDIR, check_external_volume,
                          create_block_volume, create_subdir_volume,
-                         delete_volume, expand_mounted_volume,
+                         delete_volume,
                          get_pv_hosting_volumes, is_hosting_volume_free,
                          mount_and_select_hosting_volume, search_volume,
-                         unmount_glusterfs, update_block_volume,
-                         update_free_size, update_subdir_volume,
+                         save_pv_metadata,
+                         unmount_glusterfs,
+                         update_free_size, update_pv_metadata,
+                         update_subdir_volume,
                          yield_list_of_pvcs)
 
 VOLINFO_DIR = "/var/lib/gluster"
@@ -33,7 +35,7 @@ GEN = None
 LIMIT = 30
 
 
-# noqa # pylint: disable=too-many-arguments
+# noqa # pylint: disable=too-many-arguments,too-many-positional-arguments
 def execute_gluster_quota_command(privkey, user, host, gvolname, path, size):
     """
     Function to execute the GlusterFS's quota command on external cluster
@@ -87,6 +89,70 @@ def pvc_access_mode(request):
         return vol_capability.access_mode.mode
 
 
+def existing_volume_response(volume):
+    """Build the original CSI response for an idempotent create retry."""
+    volume_context = {
+        "type": volume.extra['hostvoltype'],
+        "hostvol": volume.hostvol,
+        "pvtype": volume.voltype,
+        "fstype": "xfs",
+        "single_pv_per_pool": f"{volume.single_pv_per_pool}",
+    }
+    if not volume.single_pv_per_pool:
+        volume_context["path"] = volume.volpath
+    if volume.extra['hostvoltype'] == "External":
+        volume_context.update({
+            "gvolname": volume.extra['gvolname'],
+            "gserver": volume.extra['ghost'],
+            "options": volume.extra['goptions'],
+        })
+
+    return csi_pb2.CreateVolumeResponse(volume={
+        "volume_id": volume.volname,
+        "capacity_bytes": volume.size,
+        "volume_context": volume_context,
+    })
+
+
+def existing_volume_is_compatible(volume, request, pvtype):
+    """Check whether an existing name can satisfy a CreateVolume retry."""
+    capacity = request.capacity_range
+    if volume.size < capacity.required_bytes:
+        return False
+    if capacity.limit_bytes and volume.size > capacity.limit_bytes:
+        return False
+    if volume.voltype != pvtype:
+        return False
+
+    parameters = request.parameters
+    storage_name = parameters.get("storage_name")
+    if storage_name and storage_name != volume.hostvol:
+        return False
+
+    storage_type = parameters.get(
+        "storage_type",
+        parameters.get("hostvol_type"),
+    )
+    if storage_type and storage_type != volume.extra['hostvoltype']:
+        return False
+
+    node_affinity = parameters.get("node_affinity")
+    if node_affinity and node_affinity != volume.extra['node_affinity']:
+        return False
+
+    if volume.extra['hostvoltype'] == "External":
+        if parameters.get("gluster_hosts") != volume.extra['ghost']:
+            return False
+        if parameters.get("gluster_volname") != volume.extra['gvolname']:
+            return False
+        if parameters.get("gluster_options", "") != volume.extra['goptions']:
+            return False
+
+    return (
+        get_single_pv_per_pool(parameters) == volume.single_pv_per_pool
+    )
+
+
 class ControllerServer(csi_pb2_grpc.ControllerServicer):
     """
     ControllerServer object is responsible for handling host
@@ -115,16 +181,6 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             context.set_details(errmsg)
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return csi_pb2.CreateVolumeResponse()
-
-        # Check for same name and different capacity
-        volume = search_volume(request.name)
-        if volume:
-            if volume.size != request.capacity_range.required_bytes:
-                errmsg = "Failed to create volume with same name with different capacity"
-                logging.error(errmsg)
-                context.set_details(errmsg)
-                context.set_code(grpc.StatusCode.ALREADY_EXISTS)
-                return csi_pb2.CreateVolumeResponse()
 
         pvsize = request.capacity_range.required_bytes
 
@@ -155,6 +211,20 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 context.set_details(errmsg)
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 return csi_pb2.CreateVolumeResponse()
+
+        # CreateVolume is idempotent: retrying a compatible request must return
+        # the original volume without selecting another pool or charging space
+        # a second time.
+        volume = search_volume(request.name)
+        if volume:
+            if existing_volume_is_compatible(volume, request, pvtype):
+                return existing_volume_response(volume)
+
+            errmsg = "A volume with this name already exists incompatibly"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+            return csi_pb2.CreateVolumeResponse()
 
         logging.debug(logf(
             "Found PV type",
@@ -279,7 +349,12 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                     hostname = filters.get("gluster_hosts", None)
                     gluster_vol_name = filters.get("gluster_volname", None)
                     vol = create_subdir_volume(
-                        mntdir, request.name, pvsize, use_gluster_quota)
+                        mntdir,
+                        request.name,
+                        pvsize,
+                        use_gluster_quota,
+                        save_metadata=not use_gluster_quota,
+                    )
                     quota_size = pvsize
                     quota_path = vol.volpath
                     if use_gluster_quota is False:
@@ -293,6 +368,7 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                             context.set_details(errmsg)
                             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                             return csi_pb2.CreateVolumeResponse()
+                        save_pv_metadata(mntdir, vol.volpath, pvsize)
                 logging.info(logf(
                     "Volume created",
                     name=request.name,
@@ -613,15 +689,44 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return csi_pb2.ControllerExpandVolumeResponse()
 
-        if existing_volume.single_pv_per_pool:
-            errmsg = "PV with single_pv_per_pool doesn't support Expansion"
-            logging.error(errmsg)
-            # But lets not fail the call, and continue here
-            return csi_pb2.ControllerExpandVolumeResponse()
-
-        # Volume size before expansion
         existing_pvsize = existing_volume.size
         pvname = existing_volume.volname
+
+        # Expansion is idempotent and must never shrink an existing volume.
+        if expansion_requested_pvsize <= existing_pvsize:
+            logging.info(logf(
+                "Volume already satisfies requested capacity",
+                existing_pvsize=existing_pvsize,
+                expansion_requested_pvsize=expansion_requested_pvsize,
+                volume=pvname,
+            ))
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
+            )
+
+        if existing_volume.single_pv_per_pool:
+            errmsg = "PV with single_pv_per_pool doesn't support expansion"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
+            )
+
+        if existing_volume.voltype in (PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK):
+            errmsg = (
+                "Block volume expansion is unavailable until node-side "
+                "loop-device and filesystem growth is implemented"
+            )
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
+            )
 
         additional_pvsize_required = expansion_requested_pvsize - existing_pvsize
 
@@ -655,18 +760,12 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             errmsg = "Host volume resource is exhausted"
             context.set_details(errmsg)
             context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
-            return csi_pb2.CreateVolumeResponse()
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
+            )
 
         hostvoltype = existing_volume.extra['hostvoltype']
-
-        if pvtype == PV_TYPE_SUBVOL:
-            update_subdir_volume(
-                mntdir, hostvoltype, pvname, expansion_requested_pvsize)
-        else:
-            volume = update_block_volume(
-                pvtype, mntdir, pvname, expansion_requested_pvsize)
-            if pvtype == PV_TYPE_VIRTBLOCK:
-                expand_mounted_volume(os.path.join(mntdir, volume.volpath))
 
         if hostvoltype == 'External':
             # Use Gluster quota if set
@@ -687,7 +786,22 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             if errmsg:
                 context.set_details(errmsg)
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                return csi_pb2.ControllerExpandVolumeResponse()
+                return csi_pb2.ControllerExpandVolumeResponse(
+                    capacity_bytes=int(existing_pvsize),
+                    node_expansion_required=False,
+                )
+            update_pv_metadata(
+                mntdir,
+                existing_volume.volpath,
+                expansion_requested_pvsize,
+            )
+        else:
+            update_subdir_volume(
+                mntdir,
+                hostvoltype,
+                pvname,
+                expansion_requested_pvsize,
+            )
 
         logging.info(logf(
             "Volume expanded",
@@ -706,5 +820,6 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
 
         # send_analytics_tracker("pvc-%s" % hostvoltype, uid)
         return csi_pb2.ControllerExpandVolumeResponse(
-            capacity_bytes=int(expansion_requested_pvsize)
+            capacity_bytes=int(expansion_requested_pvsize),
+            node_expansion_required=False,
         )

@@ -1,44 +1,37 @@
 = Release management
 
-== From github UI
+== Tag-driven release workflow
 
-This is the approach kadalu team is using for release. This can be done by
-just creating a 'Release' in UI. It will trigger the script from github
-actions, and it will create all relevant scripts in the corresponding
-folder in github.
+Releases are published only by the `Release` GitHub Actions workflow. Push a
+canonical SemVer tag without a `v` prefix after the target commit has passed
+the pull-request checks. For example:
 
-Check the [Release URL here](https://github.com/kadalu/kadalu/releases)
-
-== From the Makefile
-
-1. Update CHANGELOG.md file with the list of changes and link
-2. Run `make release` to generate Operator manifest file and build
-   Containers for a specific version(and latest). Built Containers
-   will be published to dockerhub.
-+
 [source,console]
 ----
-TWINE_PASSWORD=<secret> KADALU_VERSION=0.4.0 make release
-----
-+
-**Note**: If `DOCKER_USER` is specified then it will publish the built
-Containers to respective Dockerhub account.
-+
-[source,console]
-----
-DOCKER_USER=aravindavk KADALU_VERSION=0.7.0 make release
+git tag 1.36.0
+git push origin 1.36.0
 ----
 
-3. Send the PR with manifest file and CHANGELOG.md file changes
-4. Create a new Github release - [https://github.com/kadalu/kadalu/releases/new](https://github.com/kadalu/kadalu/releases/new). In the
-   release notes, update the Operator manifest file link as,
-+
-----
-https://github.com/kadalu/kadalu/releases/latest/download/kadalu-operator.yaml
-----
-+
-For example,
-+
-----
-kubectl apply -f https://github.com/kadalu/kadalu/releases/latest/download/kadalu-operator.yaml
-----
+The workflow builds the release assets, verifies and publishes immutable
+amd64/arm64 image tags, stages the GitHub release, and only then updates
+`latest` for a stable version. Pre-release tags such as `1.36.0-rc.1` never
+move `latest`.
+
+Container images are published to `ghcr.io/joejulian` with the workflow's
+short-lived `GITHUB_TOKEN`; no long-lived registry secret is required. GitHub
+creates new container packages as private. After the first development build,
+change `kadalu-builder`, `kadalu-csi`, `kadalu-operator`, and `kadalu-server`
+to public in the account's package settings. The development and release
+workflows verify anonymous pulls and fail while any package remains private.
+PyPI publication is skipped unless this fork is explicitly configured with
+its own `TWINE_PASSWORD`; the existing `kadalu-quotad` project name belongs to
+upstream.
+
+Check the [Release URL here](https://github.com/joejulian/kadalu/releases)
+
+== Local release preparation
+
+`make prepare-release`, `make cli-build`, `make helm-chart`, and
+`make pypi-build` may be used to inspect artifacts locally. `make release`
+deliberately refuses to publish: a workstation build cannot atomically provide
+the workflow's multi-architecture and immutable-tag guarantees.

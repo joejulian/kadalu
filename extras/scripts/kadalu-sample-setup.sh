@@ -13,6 +13,7 @@ STORAGE_VALUE=NULL
 POD_FILE_PATH=../../examples/sample-app.yaml
 POD_FILE_NAME="$(basename $POD_FILE_PATH)"
 POD_NAME=pod1
+KADALU_NAMESPACE=${KADALU_NAMESPACE:-kadalu}
 
 function main(){
     if [[ $# == 0 ]]
@@ -104,7 +105,7 @@ function wait_till_pods_start(){
     do
         cnt=$((cnt + 1))
         sleep 2
-        ret_kadalu_pods=$(sudo kubectl get pods -nkadalu -o wide | grep 'Running' | wc -l)
+        ret_kadalu_pods=$(sudo kubectl get pods -n "${KADALU_NAMESPACE}" -o wide | grep 'Running' | wc -l)
         ret_pvc=$(sudo kubectl get pvc $PVC_NAME | grep 'Bound' | wc -l)
         ret_pod=$(sudo kubectl get pod $POD_NAME | grep 'Completed' | wc -l)
 
@@ -165,7 +166,7 @@ function validate_hostname(){
 function kadalu_quick_start(){
 
     # Start kadalu operator
-    sudo kubectl apply -f https://raw.githubusercontent.com/kadalu/kadalu/devel/manifests/kadalu-operator.yaml
+    sudo kubectl apply -f https://raw.githubusercontent.com/joejulian/kadalu/devel/manifests/kadalu-operator.yaml
 
     # Base storage
     echo "Hostname is ${HOSTNAME}"
@@ -174,7 +175,7 @@ function kadalu_quick_start(){
     sudo sed -i s/kube1/${HOSTNAME}/g /tmp/kadalu-storage1.yaml
     sed -ie "s|/dev/vdc|${DEVICE_FILE_PATH}|g" /tmp/kadalu-storage1.yaml
 
-    sudo kubectl apply -f /tmp/kadalu-storage1.yaml
+    sudo kubectl apply -n "${KADALU_NAMESPACE}" -f /tmp/kadalu-storage1.yaml
 
     # PV Claim
     sudo cp ${PVC_FILE_PATH} /tmp/${PVC_FILE_NAME}

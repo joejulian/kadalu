@@ -20,6 +20,7 @@ YAML_TEMPLATE = """apiVersion: "kadalu-operator.storage/v1alpha1"
 kind: "KadaluStorage"
 metadata:
   name: "${name}"
+  namespace: "${namespace}"
 """
 
 
@@ -56,7 +57,9 @@ def get_configmap_data(args):
     Get storage info data from kadalu configmap
     """
 
-    cmd = utils.kubectl_cmd(args) + ["get", "configmap", "kadalu-info", "-nkadalu", "-ojson"]
+    cmd = utils.namespaced_kubectl_cmd(args) + [
+        "get", "configmap", "kadalu-info", "-ojson"
+    ]
 
     try:
         resp = utils.execute(cmd)
@@ -86,7 +89,8 @@ def storage_add_data(args):
         "apiVersion": "kadalu-operator.storage/v1alpha1",
         "kind": "KadaluStorage",
         "metadata": {
-            "name": args.name
+            "name": args.name,
+            "namespace": args.namespace
         }
     }
 
@@ -96,7 +100,10 @@ def storage_add_data(args):
 def run(args):
     """ Adds the subcommand arguments back to main CLI tool """
 
-    yaml_content = Template(YAML_TEMPLATE).substitute(name=args.name)
+    yaml_content = Template(YAML_TEMPLATE).substitute(
+        name=args.name,
+        namespace=args.namespace,
+    )
 
     print("Storage Yaml file for your reference:\n")
     print(yaml_content)
@@ -120,7 +127,9 @@ def run(args):
         with os.fdopen(config, 'w') as tmp:
             tmp.write(yaml_content)
 
-        cmd = utils.kubectl_cmd(args) + ["delete", "-f", tempfile_path]
+        cmd = utils.namespaced_kubectl_cmd(args) + [
+            "delete", "-f", tempfile_path
+        ]
         resp = utils.execute(cmd)
         print("Storage delete request sent successfully.\n")
         print(resp.stdout)

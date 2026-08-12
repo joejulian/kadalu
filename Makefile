@@ -1,7 +1,9 @@
 .PHONY: help build-grpc build-containers gen-manifest pylint prepare-release release
 
-IMAGES_HUB?=docker.io
-DOCKER_USER?=kadalu
+CSI_PYLINT_OPTS = --generated-members='csi_pb2.*'
+
+IMAGES_HUB?=ghcr.io
+DOCKER_USER?=joejulian
 KADALU_VERSION?=devel
 KADALU_LATEST?=latest
 DISTRO?=kubernetes
@@ -14,13 +16,17 @@ help:
 	@echo "    make gen-manifest      - To generate manifest files to deploy"
 	@echo "    make pylint            - To validate all Python code with Pylint"
 	@echo "    make prepare-release   - Generate Manifest file and build containers for specific version and latest"
-	@echo "    make release           - Publish the built container images"
+	@echo "    make release           - Explain the tag-driven release workflow"
 	@echo "    make prepare-release-manifests - Prepare release manifest files"
 	@echo "    make cli-build         - Build CLI binary"
 	@echo "    make helm-chart        - Create a tgz archive of Helm chart"
 	@echo "	   make gen-requirements  - Generate requirements file for kadalu components"
 
 build-grpc:
+	# csi.proto is upstream CSI v1.12.0 with trailing whitespace normalized
+	# (SHA-256 73472606daa97c219ed33cb466a39446e6690a784ef7cd9ae8adbded247d661d).
+	# Generate with Python 3.12 and the grpcio-tools version pinned in
+	# requirements/ci_merge-requirements.txt.
 	python3 -m grpc_tools.protoc -I./csi/protos --python_out=csi --grpc_python_out=csi ./csi/protos/csi.proto
 
 build-containers: cli-build
@@ -52,8 +58,8 @@ helm-manifest:
 		--set global.kubernetesDistro=${DISTRO} \
 		--set global.image.registry=${IMAGES_HUB} \
 		--set global.image.repository=${DOCKER_USER} \
+		--set-string global.kadaluVersion=${KADALU_VERSION} \
 		--set operator.enabled=true >> manifests/kadalu-operator${filename_suffix}.yaml
-	@sed -i 's,devel,${KADALU_VERSION},g' manifests/kadalu-operator${filename_suffix}.yaml
 
 	@echo "kubectl apply -f manifests/kadalu-operator${filename_suffix}.yaml"
 	@echo ---------------------------------------------------------------------
@@ -100,11 +106,11 @@ pylint:
 	@pylint --disable=W0511 -s n server/server.py
 	@pylint --disable=W0511,W1514,C0209 -s n server/shd.py
 	@pylint --disable=W0603,W1514 -s n server/glusterutils.py
-	@pylint --disable=W0511,R0911,W0603,W1514,C0209 -s n csi/controllerserver.py
-	@pylint --disable=W0511 -s n csi/identityserver.py
-	@pylint --disable=W0511,R1732 -s n csi/main.py
-	@pylint --disable=W0511 -s n csi/nodeserver.py
-	@pylint --disable=W0511,C0302,W1514,R1710,C0209,W0621 -s n csi/volumeutils.py
+	@pylint $(CSI_PYLINT_OPTS) --disable=W0511,R0911,W0603,W1514,C0209 -s n csi/controllerserver.py
+	@pylint $(CSI_PYLINT_OPTS) --disable=W0511 -s n csi/identityserver.py
+	@pylint $(CSI_PYLINT_OPTS) --disable=W0511,R1732 -s n csi/main.py
+	@pylint $(CSI_PYLINT_OPTS) --disable=W0511 -s n csi/nodeserver.py
+	@pylint $(CSI_PYLINT_OPTS) --disable=W0511,C0302,W1514,R1710,C0209,W0621 -s n csi/volumeutils.py
 	@pylint --disable=W0511,C0302,W1514,C0209 -s n kadalu_operator/main.py
 	@pylint --disable=W0511,R0903,R0914,C0201,E0401,C0209,W1514 -s n kadalu_operator/exporter.py
 	@pylint --disable=W0511,R0914,R0912,E0401,C0114,C0209,W1514, -s n csi/exporter.py
@@ -147,39 +153,49 @@ pypi-build:
 
 helm-chart:
 	@echo "Creating tgz archive of helm chart(Version: ${KADALU_VERSION}).."
-	cd helm; sed -i -e "s/0.0.0-0/${KADALU_VERSION}/" kadalu/Chart.yaml; tar -czf kadalu-helm-chart.tgz kadalu
+	@set -e; \
+	chart_dir=$$(mktemp -d); \
+	trap 'rm -rf -- "$${chart_dir}"' EXIT; \
+	cp -a helm/kadalu "$${chart_dir}/kadalu"; \
+	for chart in \
+		"$${chart_dir}/kadalu/Chart.yaml" \
+		"$${chart_dir}/kadalu/charts/common/Chart.yaml" \
+		"$${chart_dir}/kadalu/charts/operator/Chart.yaml"; do \
+		sed -i "s/0.0.0-dev.0/${KADALU_VERSION}/g" "$${chart}"; \
+	done; \
+	helm package "$${chart_dir}/kadalu" \
+		--version ${KADALU_VERSION} \
+		--app-version ${KADALU_VERSION} \
+		--destination helm; \
+	mv helm/kadalu-${KADALU_VERSION}.tgz helm/kadalu-helm-chart.tgz
 
-# Pass PIP_ARGS="-U" for upgrading module deps, compatible with pip-compile v7.1.0
+# Run with Python 3.12 and the pip-tools version pinned in
+# requirements/ci_merge-requirements.txt. Pass PIP_ARGS="--upgrade" when
+# intentionally refreshing all dependency pins.
 gen-requirements:
 	@echo "Generating requirements file for all kadalu components and CI"
 	@cd requirements; \
-	pip-compile $(PIP_ARGS) --extra=builder -o builder-requirements.txt --allow-unsafe; \
-	pip-compile $(PIP_ARGS) --extra=operator -o operator-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=csi -o csi-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=server -o server-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=ci_submit -o ci_submit-requirements.txt; \
-	pip-compile $(PIP_ARGS) --extra=ci_merge -o ci_merge-requirements.txt --allow-unsafe
+	pip-compile $(PIP_ARGS) --strip-extras --extra=builder -o builder-requirements.txt --allow-unsafe; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=operator -o operator-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=csi -o csi-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=server -o server-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=ci_submit -o ci_submit-requirements.txt; \
+	pip-compile $(PIP_ARGS) --strip-extras --extra=ci_merge -o ci_merge-requirements.txt --allow-unsafe
 
-ifeq ($(TWINE_PASSWORD),)
 pypi-upload: pypi-build
-	cd server; twine upload --username kadalu dist/*
-else
-pypi-upload: pypi-build
-	cd server; twine upload --username kadalu -p ${TWINE_PASSWORD} dist/*
+	@test "${ALLOW_PYPI_PUBLISH}" = "true" || { \
+		echo "Refusing PyPI upload without ALLOW_PYPI_PUBLISH=true." >&2; \
+		echo "The kadalu-quotad package name belongs to the upstream project." >&2; \
+		exit 1; \
+	}
+	@test -n "${PYPI_USERNAME}" -a -n "${TWINE_PASSWORD}" || { \
+		echo "PYPI_USERNAME and TWINE_PASSWORD are required." >&2; \
+		exit 1; \
+	}
+	cd server; TWINE_USERNAME=${PYPI_USERNAME} TWINE_PASSWORD=${TWINE_PASSWORD} \
+		twine upload --non-interactive --skip-existing dist/*
 
-endif
-
-ifeq ($(KADALU_VERSION), devel)
-release: prepare-release
-else
-release: prepare-release pypi-upload cli-build helm-chart
-	docker tag ${DOCKER_USER}/kadalu-operator:${KADALU_VERSION} ${DOCKER_USER}/kadalu-operator:${KADALU_LATEST}
-	docker tag ${DOCKER_USER}/kadalu-csi:${KADALU_VERSION} ${DOCKER_USER}/kadalu-csi:${KADALU_LATEST}
-	docker tag ${DOCKER_USER}/kadalu-server:${KADALU_VERSION} ${DOCKER_USER}/kadalu-server:${KADALU_LATEST}
-	docker push ${DOCKER_USER}/kadalu-operator:${KADALU_VERSION}
-	docker push ${DOCKER_USER}/kadalu-csi:${KADALU_VERSION}
-	docker push ${DOCKER_USER}/kadalu-server:${KADALU_VERSION}
-	docker push ${DOCKER_USER}/kadalu-operator:${KADALU_LATEST}
-	docker push ${DOCKER_USER}/kadalu-csi:${KADALU_LATEST}
-	docker push ${DOCKER_USER}/kadalu-server:${KADALU_LATEST}
-endif
+release:
+	@echo "Local publishing is disabled to preserve immutable multi-architecture releases." >&2
+	@echo "Push a canonical SemVer tag and let .github/workflows/on-release-tag.yml publish it." >&2
+	@exit 1

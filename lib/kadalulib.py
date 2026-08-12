@@ -1,7 +1,9 @@
 """Utility functions"""
 
+import errno
 import logging
 import os
+import selectors
 import signal
 import socket
 import sqlite3
@@ -59,50 +61,159 @@ def retry_errors(func, args, errors, timeout=130, interval=2):
             raise
 
 
-def is_gluster_mount_proc_running(volname, mountpoint):
-    """
-    Check if glusterfs process is running for the given Volume name
-    to confirm Glusterfs process is mounted
-    """
-    cmd = (
-        r'ps ax | grep -w "/opt/sbin/glusterfs" '
-        r'| grep -- "--volfile-id %s " '
-        r'| grep -q "%s$"' % (volname, mountpoint)
-    )
+def _is_gluster_process(args, volname, mountpoint):
+    """Return whether an argument vector is the requested Gluster client."""
+    if not args or os.path.basename(args[0]) != "glusterfs":
+        return False
 
-    with subprocess.Popen(cmd,
-                          shell=True,
-                          stderr=None,
-                          stdout=None,
-                          universal_newlines=True) as proc:
-        proc.communicate()
-        return proc.returncode == 0
+    try:
+        volfile_index = args.index("--volfile-id")
+    except ValueError:
+        return False
+
+    if (
+            volfile_index + 1 >= len(args)
+            or args[volfile_index + 1] != volname):
+        return False
+    if args[-1] == mountpoint:
+        return True
+
+    try:
+        display_index = args.index("--fs-display-name")
+    except ValueError:
+        display_index = len(args)
+
+    return display_index + 2 < len(args) and args[display_index + 2] == mountpoint
+
+
+def is_gluster_mount_proc_running(volname, mountpoint):
+    """Check whether the requested Gluster client process is running."""
+    for proc_entry in os.scandir("/proc"):
+        if not proc_entry.name.isdigit():
+            continue
+
+        try:
+            cmdline_path = os.path.join(proc_entry.path, "cmdline")
+            with open(cmdline_path, "rb") as cmdline:
+                args = [
+                    arg.decode(errors="surrogateescape")
+                    for arg in cmdline.read().split(b"\0")
+                    if arg
+                ]
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+
+        if _is_gluster_process(args, volname, mountpoint):
+            return True
+
+    return False
+
+
+def _server_endpoints(hosts, port):
+    """Yield each unique address resolved for the requested server pods."""
+    endpoints = set()
+    for host in hosts:
+        try:
+            addresses = socket.getaddrinfo(
+                host,
+                int(port),
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as err:
+            logging.info(logf(
+                "Failed to resolve server pod",
+                server_pod=host,
+                error=err,
+            ))
+            continue
+
+        for family, socktype, protocol, _, address in addresses:
+            endpoint = (family, socktype, protocol, address)
+            if endpoint not in endpoints:
+                endpoints.add(endpoint)
+                yield host, endpoint
+
+
+def _start_server_connections(selector, sockets, hosts, port):
+    """Start each server connection and return true if one is immediate."""
+    pending_errors = {
+        errno.EINPROGRESS,
+        errno.EWOULDBLOCK,
+        errno.EALREADY,
+        errno.EINTR,
+    }
+    for host, (family, socktype, protocol, address) in _server_endpoints(
+            hosts, port):
+        sock = socket.socket(family, socktype, protocol)
+        sockets.append(sock)
+        sock.setblocking(False)
+        result = sock.connect_ex(address)
+        if result in (0, errno.EISCONN):
+            return True
+        if result in pending_errors:
+            selector.register(sock, selectors.EVENT_WRITE, host)
+            continue
+
+        logging.info(logf(
+            "Failed to connect to server pod",
+            server_pod=host,
+            error=os.strerror(result),
+        ))
+
+    return False
+
+
+def _wait_for_server_connection(selector, deadline):
+    """Wait until a pending server connection succeeds or time expires."""
+    while selector.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+
+        events = selector.select(remaining)
+        if not events:
+            return False
+
+        for key, _ in events:
+            sock = key.fileobj
+            selector.unregister(sock)
+            error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if error == 0:
+                return True
+
+            logging.info(logf(
+                "Failed to connect to server pod",
+                server_pod=key.data,
+                error=os.strerror(error),
+            ))
+
+    return False
 
 
 def is_server_pod_reachable(hosts, port=24007, timeout=20):
     """
-    Return True if atleast one of server pods(internal hosts),
-    are reachable at port 24007.
-    Retries every 30 seconds if the server pod is not reachable.
-    Returns False server pods are not reachable even after the timeout.
-    """
+    Return whether any server pod is reachable before the total timeout.
 
-    for host in hosts:
-        retry_count = 0
-        while retry_count < 4:
-            try:
-                with socket.create_connection((host, int(port)), timeout=timeout) as sock:
-                    sock.shutdown(socket.SHUT_RDWR)
-                return True
-            except socket.error:
-                logging.info(logf(
-                    "Waiting for the server pod to come up...",
-                    server_pod=host,
-                    retry_count=retry_count+1
-                ))
-                time.sleep(30)
-                retry_count += 1
-    return False
+    All resolved IPv4 and IPv6 endpoints are attempted concurrently so an
+    unavailable server listed first cannot delay a healthy endpoint. Writable
+    non-blocking sockets are checked with SO_ERROR because select also marks a
+    refused connection writable.
+    """
+    if not hosts or timeout <= 0:
+        return False
+
+    selector = selectors.DefaultSelector()
+    sockets = []
+    deadline = time.monotonic() + timeout
+    try:
+        if _start_server_connections(selector, sockets, hosts, port):
+            return True
+        return _wait_for_server_connection(selector, deadline)
+    finally:
+        selector.close()
+        for sock in sockets:
+            sock.close()
 
 
 def is_host_reachable(hosts, port):
@@ -111,15 +222,14 @@ def is_host_reachable(hosts, port):
     timeout = 5
     for host in hosts:
         try:
-            sock = socket.create_connection((host, int(port)), timeout=timeout)
-            sock.shutdown(socket.SHUT_RDWR)
+            with socket.create_connection(
+                    (host, int(port)), timeout=timeout) as sock:
+                sock.shutdown(socket.SHUT_RDWR)
             return True
         except socket.error as msg:
             logging.error(logf("Failed to open socket connection",
                                error=msg, host=host))
             continue
-        finally:
-            sock.close()
     return False
 
 

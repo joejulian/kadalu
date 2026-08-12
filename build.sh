@@ -2,14 +2,16 @@
 
 set -e -o pipefail
 
-DOCKER_USER="${DOCKER_USER:-kadalu}"
+DOCKER_USER="${DOCKER_USER:-joejulian}"
 KADALU_VERSION="${KADALU_VERSION}"
 BUILD_BASE=${BUILD_BASE:-yes}
 
 RUNTIME_CMD=${RUNTIME_CMD:-docker}
 # Use buildx for docker to simulate release script in github workflow
 # Requires Docker >=v19.03
-PLATFORM=$(uname -m | sed 's|aarch64|arm64|' | sed 's|x86_64|amd64|' | sed 's|armv7l|arm/v7|')
+HOST_PLATFORM=$(uname -m | sed 's|aarch64|arm64|' | sed 's|x86_64|amd64|' | sed 's|armv7l|arm/v7|')
+PLATFORM=${PLATFORM:-${HOST_PLATFORM}}
+TARGETARCH=${TARGETARCH:-${PLATFORM%%/*}}
 build="buildx build --platform linux/$PLATFORM --load"
 if [[ "${RUNTIME_CMD}" == "buildah" ]]; then
         build="bud"
@@ -36,11 +38,20 @@ else
         VERSION="0.0.0+g${FULL_DESCRIBE//-/.}"
 fi
 
-BUILDDATE="$(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git show -s --format=%ct HEAD)}"
+if [[ ! "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]]; then
+    echo "SOURCE_DATE_EPOCH must be an integer Unix timestamp" >&2
+    exit 1
+fi
+BUILDDATE="$(date --utc --date="@${SOURCE_DATE_EPOCH}" '+%Y-%m-%dT%H:%M:%SZ')"
 
 build_args=()
 build_args+=(--build-arg "version=$VERSION")
 build_args+=(--build-arg "builddate=$BUILDDATE")
+build_args+=(--build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH")
+build_args+=(--build-arg "TARGETARCH=$TARGETARCH")
+build_args+=(--build-arg "revision=$(git rev-parse HEAD)")
+build_args+=(--build-arg "source=https://github.com/joejulian/kadalu")
 
 # Print Docker version
 echo "=== $RUNTIME_CMD version ==="
@@ -54,6 +65,7 @@ function build_container()
     $RUNTIME_CMD $build \
                  -t "${DOCKER_USER}/${IMAGE_NAME}:${VER}" \
                  "${build_args[@]}" \
+                 --build-arg "builder_image=${BUILDER_IMAGE}" \
                  --network host \
                  -f "$DOCKERFILE" \
                  --target prod \
@@ -63,6 +75,10 @@ function build_container()
 if [ "x${KADALU_VERSION}" = "x" ]; then
     KADALU_VERSION=${VERSION}
 fi
+
+BUILDER_TAG="${BUILDER_TAG:-${KADALU_VERSION//+/-}}"
+BUILDER_TAG="${BUILDER_TAG//\//-}"
+BUILDER_IMAGE="${BUILDER_IMAGE:-${DOCKER_USER}/builder:${BUILDER_TAG}}"
 
 CONTAINERS_FOR=${CONTAINERS_FOR:-"DEVELOPMENT"}
 
@@ -82,11 +98,11 @@ echo "Building base builder image - This may take a while"
 
 if [ ${BUILD_BASE} == "yes" ]; then
   $RUNTIME_CMD $build \
-        -t "${DOCKER_USER}/builder:latest" "${build_args[@]}" \
+        -t "${BUILDER_IMAGE}" "${build_args[@]}" \
         --network host -f extras/Dockerfile.builder .
 else
   # pull the base image if we don't want to build it
-  $RUNTIME_CMD pull "${DOCKER_USER}/builder:latest"
+  $RUNTIME_CMD pull "${BUILDER_IMAGE}"
 fi
 
 echo "Building kadalu-server with version tag as ${VERSION}";

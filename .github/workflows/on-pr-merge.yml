@@ -1,176 +1,185 @@
-name: "On Merge"
-
-# This gets built when a PR gets merged
+name: Development Images
 
 on:
   push:
-    paths-ignore:
-      - 'doc/**'
-      - '**.md'
-      - 'extras/**'
-      - 'helm/**'
     branches:
       - devel
-# Add tags later (for pushing release)
+    paths-ignore:
+      - "doc/**"
+      - "**.md"
 
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: development-images
+  cancel-in-progress: true
 
 jobs:
-  devel-tag-push:
-    runs-on: ubuntu-latest
+  publish:
+    name: Publish multi-architecture development images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
     steps:
-      - name: Check out Code
-        uses: actions/checkout@v2
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      - name: Login to DockerHub
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Set up Python (for cli-build)
-        uses: actions/setup-python@v1
-        with:
-          python-version: '3.10'
+          fetch-depth: 0
 
-      - uses: actions/cache@v2
-        with:
-          path: ${{ env.pythonLocation }}
-          key: ${{ env.pythonLocation }}-${{ hashFiles('requirements/ci_merge-requirements.txt') }}
-
-      - name: Get the CLI build (kubectl-kadalu)
+      - name: Derive GHCR namespace
+        id: registry
         run: |
-          python -m pip install --upgrade --upgrade-strategy eager -r requirements/ci_merge-requirements.txt -e ./requirements
+          echo "namespace=${GITHUB_REPOSITORY_OWNER,,}" >>"${GITHUB_OUTPUT}"
+
+      - name: Derive reproducible image metadata
+        id: metadata
+        run: |
+          echo "builddate=$(git show --no-patch --format=%cI "${GITHUB_SHA}")" \
+            >>"${GITHUB_OUTPUT}"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci_merge-requirements.txt
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential libattr1-dev
+
+      - name: Build kubectl-kadalu
+        run: |
+          python -m pip install --requirement requirements/ci_merge-requirements.txt
+          python -m pip install --no-deps --editable ./requirements
           KADALU_VERSION=devel make cli-build
 
-      - name: Check to build and push base image or not
-        id: build_base
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Preserve immutable commit image tags
+        id: images
+        env:
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          # same conditions as mentioned in submit workflow
-          FILES=$(git show --pretty="" --name-only)
-          build_base='no'
-          if grep -e 'CHANGELOG.md' <<< "$b" && [ $(wc -w <<< "$b") == 1 ]; then
-            build_base='yes'
-          elif grep -e 'extras/Dockerfile.builder' <<< "$FILES"; then
-            build_base='yes'
-          fi
-          echo ::set-output name=out::$build_base
-      - name: Builder Image
-        if: "contains(steps.build_base.outputs.build_base, 'yes')"
-        uses: docker/build-push-action@v2
-        timeout-minutes: 120
+          while read -r key image; do
+            reference="ghcr.io/${REGISTRY_NAMESPACE}/${image}:${GITHUB_SHA}"
+            if docker buildx imagetools inspect "${reference}" >/dev/null 2>&1; then
+              tests/ci/verify-image-provenance.sh \
+                "${reference}" "${GITHUB_SHA}" "${EXPECTED_SOURCE}"
+              echo "${key}_missing=false" >>"${GITHUB_OUTPUT}"
+              echo "Preserving existing immutable image ${reference}"
+            else
+              echo "${key}_missing=true" >>"${GITHUB_OUTPUT}"
+            fi
+          done <<'IMAGES'
+          builder kadalu-builder
+          csi kadalu-csi
+          operator kadalu-operator
+          server kadalu-server
+          IMAGES
+
+      - name: Build and publish builder image
+        if: steps.images.outputs.builder_missing == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: extras/Dockerfile.builder
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
-          load: true
-          tags: |
-            docker.io/kadalu/builder:latest
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ github.sha }}
           build-args: |
-            version==${{ github.sha }}
-            builddate=`date +%Y-%m-%d-%H:%M`
-          secrets: |
-            KADALU_VERSION=${{ github.sha }}
-      - name: Build CSI Image and push
-        uses: docker/build-push-action@v2
-        timeout-minutes: 120
+            version=${{ github.sha }}
+            builddate=${{ steps.metadata.outputs.builddate }}
+            revision=${{ github.sha }}
+            source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and publish CSI image
+        if: steps.images.outputs.csi_missing == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: csi/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           target: prod
           push: true
-          tags: |
-            docker.io/kadalu/kadalu-csi:${{ github.sha }}
-            docker.io/kadalu/kadalu-csi:devel
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-csi:${{ github.sha }}
           build-args: |
-            version==${{ github.sha }}
-            builddate=`date +%Y-%m-%d-%H:%M`
-          secrets: |
-            KADALU_VERSION=${{ github.sha }}
-      - name: Build Operator Image and push
-        uses: docker/build-push-action@v2
-        timeout-minutes: 20
+            builder_image=ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ github.sha }}
+            version=${{ github.sha }}
+            builddate=${{ steps.metadata.outputs.builddate }}
+            revision=${{ github.sha }}
+            source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and publish operator image
+        if: steps.images.outputs.operator_missing == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: kadalu_operator/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           target: prod
           push: true
-          tags: |
-            docker.io/kadalu/kadalu-operator:${{ github.sha }}
-            docker.io/kadalu/kadalu-operator:devel
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-operator:${{ github.sha }}
           build-args: |
-            version==${{ github.sha }}
-            builddate=`date +%Y-%m-%d-%H:%M`
-          secrets: |
-            KADALU_VERSION=${{ github.sha }}
-      - name: Build Storage Server Image and push
-        uses: docker/build-push-action@v2
-        timeout-minutes: 20
+            builder_image=ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ github.sha }}
+            version=${{ github.sha }}
+            builddate=${{ steps.metadata.outputs.builddate }}
+            revision=${{ github.sha }}
+            source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Build and publish server image
+        if: steps.images.outputs.server_missing == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: server/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           target: prod
           push: true
-          tags: |
-            docker.io/kadalu/kadalu-server:${{ github.sha }}
-            docker.io/kadalu/kadalu-server:devel
+          tags: ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-server:${{ github.sha }}
           build-args: |
-            version==${{ github.sha }}
-            builddate=`date +%Y-%m-%d-%H:%M`
-          secrets: |
-            KADALU_VERSION=${{ github.sha }}
+            builder_image=ghcr.io/${{ steps.registry.outputs.namespace }}/kadalu-builder:${{ github.sha }}
+            version=${{ github.sha }}
+            builddate=${{ steps.metadata.outputs.builddate }}
+            revision=${{ github.sha }}
+            source=${{ github.server_url }}/${{ github.repository }}
 
-      # What follows are basically building and pushing of tests images conditionally
-      - name: Check for Dockerfile changes in tests folder
-        id: build_test
+      - name: Update moving development tags
+        env:
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          build_test='no'
-          # Get files part of the merge
-          FILES=$(git show --pretty="" --name-only)
-          if grep -e '^tests.*Dockerfile$' <<< "$FILES"; then
-            build_test='yes'
-          fi
-          echo ::set-output name=build_test::$build_test
-      - name: Build test-io image used in CI
-        if: "contains(steps.build_test.outputs.build_test, 'yes')"
-        uses: docker/build-push-action@v2
-        timeout-minutes: 10
-        with:
-          context: .
-          file: tests/test-io/Dockerfile
-          platforms: linux/amd64
-          target: prod
-          push: true
-          tags: |
-            docker.io/kadalu/test-io:${{ github.sha }}
-            docker.io/kadalu/test-io:devel
-          build-args: |
-            version==${{ github.sha }}
-            builddate=`date +%Y-%m-%d-%H:%M`
-          secrets: |
-            KADALU_VERSION=${{ github.sha }}
-      - name: Build test-csi image used in CI
-        if: "contains(steps.build_test.outputs.build_test, 'yes')"
-        uses: docker/build-push-action@v2
-        timeout-minutes: 10
-        with:
-          context: .
-          file: tests/test-csi/Dockerfile
-          platforms: linux/amd64
-          target: prod
-          push: true
-          tags: |
-            docker.io/kadalu/test-csi:${{ github.sha }}
-            docker.io/kadalu/test-csi:devel
-          build-args: |
-            version==${{ github.sha }}
-            builddate=`date +%Y-%m-%d-%H:%M`
-          secrets: |
-            KADALU_VERSION=${{ github.sha }}
+          for image in kadalu-builder kadalu-csi kadalu-operator kadalu-server; do
+            tests/ci/verify-image-provenance.sh \
+              "ghcr.io/${REGISTRY_NAMESPACE}/${image}:${GITHUB_SHA}" \
+              "${GITHUB_SHA}" \
+              "${EXPECTED_SOURCE}"
+            docker buildx imagetools create \
+              --tag "ghcr.io/${REGISTRY_NAMESPACE}/${image}:devel" \
+              "ghcr.io/${REGISTRY_NAMESPACE}/${image}:${GITHUB_SHA}"
+          done
+
+      - name: Verify development images are anonymously pullable
+        env:
+          REGISTRY_NAMESPACE: ${{ steps.registry.outputs.namespace }}
+        run: |
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf -- "${anonymous_config}"' EXIT
+          for image in kadalu-builder kadalu-csi kadalu-operator kadalu-server; do
+            DOCKER_CONFIG="${anonymous_config}" docker manifest inspect \
+              "ghcr.io/${REGISTRY_NAMESPACE}/${image}:devel" >/dev/null
+          done

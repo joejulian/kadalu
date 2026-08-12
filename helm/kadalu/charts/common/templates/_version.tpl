@@ -4,9 +4,11 @@
 Kadalu KADALU_VERSION
 */}}
 {{- define "common.version" -}}
-{{- if eq .Chart.Version "0.0.0-0" -}}
-{{ print "devel" }}
+{{- if .Values.global.kadaluVersion -}}
+{{- .Values.global.kadaluVersion -}}
+{{- else if eq .Chart.Version "0.0.0-dev.0" -}}
+{{- "devel" -}}
 {{- else -}}
-{{ .Chart.Version }}
+{{- .Chart.Version -}}
 {{- end -}}
 {{- end -}}

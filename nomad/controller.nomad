@@ -24,7 +24,7 @@ variable "gluster_volname" {
 }
 
 variable "kadalu_version" {
-  default     = "1.1.0"
+  default     = "devel"
   description = "Kadalu CSI version which is tested against Nomad version mentioned in README.md"
 }
 
@@ -107,7 +107,7 @@ job "kadalu-csi-controller" {
       }
 
       config {
-        image = "docker.io/kadalu/kadalu-csi:${var.kadalu_version}"
+        image = "ghcr.io/joejulian/kadalu-csi:${var.kadalu_version}"
 
         # Nomad client config for docker plugin should have privileged set to 'true'
         # refer https://www.nomadproject.io/docs/drivers/docker#privileged

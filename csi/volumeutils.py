@@ -42,12 +42,14 @@ class Volume():
         self.volhash = kwargs.get("volhash", None)
         self.volpath = kwargs.get("volpath", None)
         self.hostvol = hostvol
-        self.single_pv_per_pool = False
+        self.single_pv_per_pool = kwargs.get("single_pv_per_pool", False)
         self.size = kwargs.get("size", None)
         self.extra = {}
         self.extra['ghost'] = kwargs.get("ghost", None)
         self.extra['hostvoltype'] = kwargs.get("hostvoltype", None)
         self.extra['gvolname'] = kwargs.get("gvolname", None)
+        self.extra['goptions'] = kwargs.get("goptions", "")
+        self.extra['node_affinity'] = kwargs.get("node_affinity", None)
         self.setpath()
 
     def setpath(self):
@@ -177,7 +179,11 @@ def get_pv_hosting_volumes(filters={}, iteration=40):
                 "g_volname": data.get("gluster_volname", None),
                 "g_host": data.get("gluster_hosts", None),
                 "g_options": data.get("gluster_options", ""),
-                "single_pv_per_pool": get_single_pv_per_pool(data)
+                "single_pv_per_pool": get_single_pv_per_pool(data),
+                "node_affinity": (
+                    data.get("bricks", [{}])[0].get("kube_hostname")
+                    if data.get("bricks") else None
+                ),
             }
 
             volumes.append(volume)
@@ -322,7 +328,9 @@ def save_pv_metadata(hostvol_mnt, pvpath, pvsize):
         ))
 
 
-def create_subdir_volume(hostvol_mnt, volname, size, use_gluster_quota):
+def create_subdir_volume(
+        hostvol_mnt, volname, size, use_gluster_quota,
+        save_metadata=True):
     """Create sub directory Volume"""
     volhash = get_volname_hash(volname)
     volpath = get_volume_path(PV_TYPE_SUBVOL, volhash, volname)
@@ -343,7 +351,8 @@ def create_subdir_volume(hostvol_mnt, volname, size, use_gluster_quota):
 
     # Write info file so that Brick's quotad sidecar
     # container picks it up (or) for external quota expansion
-    save_pv_metadata(hostvol_mnt, volpath, size)
+    if save_metadata:
+        save_pv_metadata(hostvol_mnt, volpath, size)
 
     if use_gluster_quota is True:
         return Volume(
@@ -450,7 +459,9 @@ def is_hosting_volume_free(hostvol, requested_pvsize):
         return False
 
 
-def update_subdir_volume(hostvol_mnt, hostvoltype, volname, expansion_requested_pvsize):
+def update_subdir_volume(
+        hostvol_mnt, hostvoltype, volname, expansion_requested_pvsize,
+        update_metadata=True):
     """Update sub directory Volume"""
 
     volhash = get_volname_hash(volname)
@@ -472,7 +483,8 @@ def update_subdir_volume(hostvol_mnt, hostvoltype, volname, expansion_requested_
 
     # Write info file so that Brick's quotad sidecar
     # container picks it up.
-    update_pv_metadata(hostvol_mnt, volpath, expansion_requested_pvsize)
+    if update_metadata:
+        update_pv_metadata(hostvol_mnt, volpath, expansion_requested_pvsize)
 
     # Wait for quota set
     # TODO: Handle Timeout
@@ -775,8 +787,6 @@ def search_volume(volname):
 
     host_volumes = get_pv_hosting_volumes({})
     for volume in host_volumes:
-        if volname != volume['name']:
-            continue
         hvol = volume['name']
         mntdir = os.path.join(HOSTVOL_MOUNTDIR, hvol)
         mount_glusterfs(volume, mntdir)
@@ -808,6 +818,8 @@ def search_volume(volname):
                     hostvoltype=volume.get('type', None),
                     ghost=volume.get('g_host', None),
                     gvolname=volume.get('g_volname', None),
+                    goptions=volume.get('g_options', ""),
+                    node_affinity=volume.get('node_affinity', None),
                 )
     return None
 

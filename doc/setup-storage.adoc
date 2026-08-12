@@ -21,10 +21,10 @@ Check the status of Pods using,
 $ kubectl get pods -nkadalu
 NAME                             READY   STATUS    RESTARTS   AGE
 server-storage-pool-1-kube1-0    1/1     Running   0          84s
-csi-nodeplugin-5hfms             2/2     Running   0          30m
-csi-nodeplugin-924cc             2/2     Running   0          30m
-csi-nodeplugin-cbjl9             2/2     Running   0          30m
-csi-provisioner-0                3/3     Running   0          30m
+kadalu-csi-nodeplugin-5hfms      4/4     Running   0          30m
+kadalu-csi-nodeplugin-924cc      4/4     Running   0          30m
+kadalu-csi-nodeplugin-cbjl9      4/4     Running   0          30m
+kadalu-csi-provisioner-0         5/5     Running   0          30m
 operator-6dfb65dcdd-r664t        1/1     Running   0          30m
 ----
 
