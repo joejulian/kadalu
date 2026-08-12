@@ -51,6 +51,10 @@ COPY lib/startup.sh                         /kadalu/startup.sh
 
 RUN chmod +x /kadalu/startup.sh
 
+RUN groupadd --gid 1000 kadalu && \
+    useradd --uid 1000 --gid kadalu --home-dir /kadalu \
+        --no-create-home --shell /usr/sbin/nologin kadalu
+
 ARG version="(unknown)"
 # Container build time (date -u '+%Y-%m-%dT%H:%M:%S.%NZ')
 ARG builddate="(unknown)"
@@ -63,6 +67,8 @@ LABEL vcs-type="git"
 LABEL vcs-url="https://github.com/kadalu/kadalu"
 LABEL vendor="kadalu"
 LABEL version="${version}"
+
+USER 1000:1000
 
 ENTRYPOINT ["python3", "/kadalu/start.py"]
 

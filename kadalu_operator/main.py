@@ -28,7 +28,8 @@ K8S_DIST = os.environ.get("K8S_DIST", "kubernetes")
 IMAGES_HUB = os.environ.get("IMAGES_HUB", "docker.io")
 KUBELET_DIR = os.environ.get("KUBELET_DIR")
 VERBOSE = os.environ.get("VERBOSE", "no")
-MANIFESTS_DIR = "/kadalu/templates"
+TEMPLATES_DIR = os.environ.get("KADALU_TEMPLATES_DIR", "/kadalu/templates")
+MANIFESTS_DIR = os.environ.get("KADALU_MANIFESTS_DIR", "/tmp/kadalu-manifests")
 KUBECTL_CMD = "/usr/bin/kubectl"
 KADALU_CONFIG_MAP = "kadalu-info"
 CSI_POD_PREFIX = "csi-"
@@ -53,13 +54,17 @@ NODE_PLUGIN = "kadalu-csi-nodeplugin"
 
 def template(filename, **kwargs):
     """Substitute the template with provided fields"""
-    content = ""
-    with open(filename + ".j2") as template_file:
+    template_filename = os.path.join(
+        TEMPLATES_DIR,
+        os.path.basename(filename) + ".j2",
+    )
+    with open(template_filename, encoding="utf-8") as template_file:
         content = template_file.read()
 
     if kwargs.get("render", False):
         return Template(content).render(**kwargs)
 
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     return Template(content).stream(**kwargs).dump(filename)
 
 
@@ -1017,7 +1022,7 @@ def deploy_storage_class(obj):
     api_instance = client.StorageV1Api()
     scs = api_instance.list_storage_class()
     sc_names = []
-    for tmpl in os.listdir(MANIFESTS_DIR):
+    for tmpl in os.listdir(TEMPLATES_DIR):
         if tmpl.startswith("storageclass-") and tmpl.endswith(".j2"):
             sc_names.append(
                 tmpl.replace("storageclass-", "").replace(".yaml.j2", "")
