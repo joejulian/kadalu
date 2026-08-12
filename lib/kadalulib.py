@@ -1,7 +1,9 @@
 """Utility functions"""
 
+import errno
 import logging
 import os
+import selectors
 import signal
 import socket
 import sqlite3
@@ -81,28 +83,91 @@ def is_gluster_mount_proc_running(volname, mountpoint):
 
 def is_server_pod_reachable(hosts, port=24007, timeout=20):
     """
-    Return True if atleast one of server pods(internal hosts),
-    are reachable at port 24007.
-    Retries every 30 seconds if the server pod is not reachable.
-    Returns False server pods are not reachable even after the timeout.
-    """
+    Return whether any server pod is reachable before the total timeout.
 
-    for host in hosts:
-        retry_count = 0
-        while retry_count < 4:
+    All resolved IPv4 and IPv6 endpoints are attempted concurrently so an
+    unavailable server listed first cannot delay a healthy endpoint. Writable
+    non-blocking sockets are checked with SO_ERROR because select also marks a
+    refused connection writable.
+    """
+    if not hosts or timeout <= 0:
+        return False
+
+    selector = selectors.DefaultSelector()
+    sockets = []
+    deadline = time.monotonic() + timeout
+
+    try:
+        endpoints = set()
+        for host in hosts:
             try:
-                with socket.create_connection((host, int(port)), timeout=timeout) as sock:
-                    sock.shutdown(socket.SHUT_RDWR)
-                return True
-            except socket.error:
+                addresses = socket.getaddrinfo(
+                    host,
+                    int(port),
+                    family=socket.AF_UNSPEC,
+                    type=socket.SOCK_STREAM,
+                )
+            except socket.gaierror as err:
                 logging.info(logf(
-                    "Waiting for the server pod to come up...",
+                    "Failed to resolve server pod",
                     server_pod=host,
-                    retry_count=retry_count+1
+                    error=err,
                 ))
-                time.sleep(30)
-                retry_count += 1
-    return False
+                continue
+
+            for family, socktype, protocol, _, address in addresses:
+                endpoint = (family, socktype, protocol, address)
+                if endpoint in endpoints:
+                    continue
+                endpoints.add(endpoint)
+
+                sock = socket.socket(family, socktype, protocol)
+                sockets.append(sock)
+                sock.setblocking(False)
+                result = sock.connect_ex(address)
+                if result in (0, errno.EISCONN):
+                    return True
+                if result in (
+                        errno.EINPROGRESS,
+                        errno.EWOULDBLOCK,
+                        errno.EALREADY,
+                        errno.EINTR):
+                    selector.register(sock, selectors.EVENT_WRITE, host)
+                    continue
+
+                logging.info(logf(
+                    "Failed to connect to server pod",
+                    server_pod=host,
+                    error=os.strerror(result),
+                ))
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            events = selector.select(remaining)
+            if not events:
+                break
+
+            for key, _ in events:
+                sock = key.fileobj
+                selector.unregister(sock)
+                error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if error == 0:
+                    return True
+
+                logging.info(logf(
+                    "Failed to connect to server pod",
+                    server_pod=key.data,
+                    error=os.strerror(error),
+                ))
+
+        return False
+    finally:
+        selector.close()
+        for sock in sockets:
+            sock.close()
 
 
 def is_host_reachable(hosts, port):
