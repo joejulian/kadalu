@@ -76,7 +76,7 @@ def run(args):
 
     data = {}
 
-    cmd = utils.kubectl_cmd(args) + [
+    cmd = utils.namespaced_kubectl_cmd(args) + [
         "get", "kadalustorages.kadalu-operator.storage",
         args.name, "-ojson"]
 
@@ -112,7 +112,7 @@ def run(args):
         # Write the data to the file in JSON format
         json.dump(data, temp_file)
 
-    cmd = utils.kubectl_cmd(args) + [
+    cmd = utils.namespaced_kubectl_cmd(args) + [
         "apply", "-f", temp_file_path]
 
     try:

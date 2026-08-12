@@ -53,7 +53,7 @@ def get_options_from_crd(args, storage_name):
 
     data = {}
 
-    cmd = utils.kubectl_cmd(args) + [
+    cmd = utils.namespaced_kubectl_cmd(args) + [
         "get", "kadalustorages.kadalu-operator.storage",
         storage_name, "-ojson"]
 
@@ -168,8 +168,8 @@ def fetch_status(storages, args):
                  "select count(pvname), sum(size), min(size), "
                  "avg(size), max(size) from pv_stats")
 
-        cmd = utils.kubectl_cmd(args) + [
-            "exec", "-it", "-nkadalu",
+        cmd = utils.namespaced_kubectl_cmd(args) + [
+            "exec", "-it",
             "kadalu-csi-provisioner-0",
             "-c", "kadalu-provisioner",
             "--", "sqlite3",
@@ -205,7 +205,9 @@ def fetch_status(storages, args):
 
 def run(args):
     """Shows List of Storages"""
-    cmd = utils.kubectl_cmd(args) + ["get", "configmap", "kadalu-info", "-nkadalu", "-ojson"]
+    cmd = utils.namespaced_kubectl_cmd(args) + [
+        "get", "configmap", "kadalu-info", "-ojson"
+    ]
 
     try:
         resp = utils.execute(cmd)

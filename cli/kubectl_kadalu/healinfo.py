@@ -37,8 +37,9 @@ def check_server_pod_is_up(server_pod, args):
     Return False if server_pod is down
     """
 
-    cmd = utils.kubectl_cmd(args) + ["get", "pods", "-nkadalu", server_pod,
-                                     "-o", "jsonpath={.status.phase}"]
+    cmd = utils.namespaced_kubectl_cmd(args) + [
+        "get", "pods", server_pod, "-o", "jsonpath={.status.phase}"
+    ]
 
     try:
         resp = utils.execute(cmd)
@@ -58,7 +59,6 @@ def exec_server_and_fetch_healinfo(server_pod, args):
 
     try:
         heal_info_cmd = ["exec",
-                         "-nkadalu",
                          server_pod,
                          "--", "/kadalu/heal-info.sh"]
 
@@ -66,7 +66,7 @@ def exec_server_and_fetch_healinfo(server_pod, args):
         if args.name is not None:
             heal_info_cmd.append(args.name)
 
-        cmd = utils.kubectl_cmd(args) + heal_info_cmd
+        cmd = utils.namespaced_kubectl_cmd(args) + heal_info_cmd
         resp = utils.execute(cmd)
         print(resp.stdout)
         print()
@@ -85,7 +85,6 @@ def exec_csi_and_heal(args):
 
     try:
         client_heal_cmd = ["exec",
-                           "-nkadalu",
                            "kadalu-csi-provisioner-0",
                            "-c",
                            "kadalu-provisioner",
@@ -94,7 +93,7 @@ def exec_csi_and_heal(args):
         if args.name is not None:
             client_heal_cmd.append(args.name)
 
-        cmd = utils.kubectl_cmd(args) + client_heal_cmd
+        cmd = utils.namespaced_kubectl_cmd(args) + client_heal_cmd
         resp = utils.execute(cmd)
         print(resp.stdout)
         print()
@@ -111,7 +110,9 @@ def run(args):
         exec_csi_and_heal(args)
         sys.exit(0)
 
-    cmd = utils.kubectl_cmd(args) + ["get", "configmap", "kadalu-info", "-nkadalu", "-ojson"]
+    cmd = utils.namespaced_kubectl_cmd(args) + [
+        "get", "configmap", "kadalu-info", "-ojson"
+    ]
 
     try:
         resp = utils.execute(cmd)

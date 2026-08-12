@@ -69,16 +69,16 @@ def run(args):
             container = '-c' + args.container
 
         if not args.podname:
-            cmd = utils.kubectl_cmd(args) + [
-                "get", "pods", "-nkadalu", "-oname"
+            cmd = utils.namespaced_kubectl_cmd(args) + [
+                "get", "pods", "-oname"
             ]
             resp = utils.execute(cmd)
             # Remove empty lines(pod-names) from command response
             pods = resp.stdout.split()
 
         for pod in pods:
-            log_cmd = utils.kubectl_cmd(args) + [
-                "logs", "-nkadalu", pod, container
+            log_cmd = utils.namespaced_kubectl_cmd(args) + [
+                "logs", pod, container
             ]
             log_resp = utils.execute(log_cmd)
             print("----- (Kadalu Namespace) %s -----" % pod)
