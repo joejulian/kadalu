@@ -1,31 +1,62 @@
 """
 controller server implementation
 """
+# pylint: disable=too-many-lines
+import functools
+import errno
+import fcntl
+import hashlib
+import inspect
 import json
 import logging
 import os
 import random
+import shlex
+import threading
 import time
+from contextlib import contextmanager
 
 import csi_pb2
 import csi_pb2_grpc
 import grpc
 from kadalulib import (PV_TYPE_RAWBLOCK, PV_TYPE_SUBVOL, PV_TYPE_VIRTBLOCK,
-                       CommandException, execute, logf, reachable_host,
+                       CommandException, execute, is_valid_csi_identifier,
+                       logf, reachable_host,
                        send_analytics_tracker, get_single_pv_per_pool)
 from volumeutils import (HOSTVOL_MOUNTDIR, check_external_volume,
+                         claim_single_pv_volume,
                          create_block_volume, create_subdir_volume,
                          delete_volume,
-                         get_pv_hosting_volumes, is_hosting_volume_free,
-                         mount_and_select_hosting_volume, search_volume,
+                         get_accounted_pv_size, get_pv_hosting_volumes,
+                         is_hosting_volume_free,
+                         mount_and_select_hosting_volume,
+                         mount_single_pv_hosting_volume, search_volume,
+                         finish_volume_expansion,
+                         finish_volume_creation,
+                         LegacySinglePVPoolUnclaimedError,
+                         read_volume_creation_intent,
+                         read_volume_expansion_intent,
+                         reserve_volume_expansion,
+                         SinglePVPoolClaimedError,
+                         SinglePVPoolNotEmptyError,
+                         SinglePVPoolRetiredError,
+                         UnsupportedCapacityRangeError,
+                         UnsupportedReclaimPolicyError,
+                         VolumeOperationConflictError,
+                         VolumeOperationLockTimeoutError,
                          save_pv_metadata,
+                         single_pv_operation_lock,
                          unmount_glusterfs,
                          update_free_size, update_pv_metadata,
                          update_subdir_volume,
+                         validate_committed_creation,
+                         volume_operation_lock,
+                         volume_incarnation,
                          yield_list_of_pvcs)
 
 VOLINFO_DIR = "/var/lib/gluster"
 KADALU_VERSION = os.environ.get("KADALU_VERSION", "latest")
+DEFAULT_VOLUME_SIZE = 1024 * 1024 * 1024
 
 # Generator to be used in ListVolumes
 GEN = None
@@ -33,6 +64,379 @@ GEN = None
 # Rate limiting number of PVCs returned per request of ListVolumes if CO
 # doesn't mention any max_entries
 LIMIT = 30
+
+# Create, expand, and delete each perform filesystem work between checking and
+# updating stat.db. Keep those operations in one process-wide critical section
+# so concurrent CSI requests cannot consume the same free capacity.
+CAPACITY_OPERATION_LOCK = threading.Lock()
+CAPACITY_LOCK_WAIT_TIMEOUT_SECONDS = 1.0
+CREATE_IDENTITY_LOCK_DIR = os.environ.get(
+    "KADALU_CREATE_IDENTITY_LOCK_DIR",
+    "/var/lib/kadalu/create-locks",
+)
+
+
+def serialized_capacity_operation(method):
+    """Serialize controller operations which change pool capacity."""
+    # Manual acquire/release is required so lock acquisition can honor the
+    # gRPC deadline before entering the protected operation.
+    # pylint: disable=consider-using-with
+    @functools.wraps(method)
+    def locked_method(*args, **kwargs):
+        context = kwargs.get("context")
+        if context is None and len(args) >= 3:
+            context = args[2]
+
+        remaining = None
+        time_remaining = getattr(context, "time_remaining", None)
+        if callable(time_remaining):
+            remaining = time_remaining()
+
+        if remaining is None:
+            acquired = CAPACITY_OPERATION_LOCK.acquire(
+                timeout=CAPACITY_LOCK_WAIT_TIMEOUT_SECONDS,
+            )
+        elif remaining <= 0:
+            acquired = False
+        else:
+            acquired = CAPACITY_OPERATION_LOCK.acquire(
+                timeout=min(
+                    remaining,
+                    CAPACITY_LOCK_WAIT_TIMEOUT_SECONDS,
+                    threading.TIMEOUT_MAX,
+                ),
+            )
+
+        if not acquired:
+            errmsg = "Another capacity operation is still in progress"
+            logging.warning(errmsg)
+            abort = getattr(context, "abort", None)
+            if callable(abort):
+                abort(grpc.StatusCode.ABORTED, errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.ABORTED)
+            return None
+
+        try:
+            return method(*args, **kwargs)
+        finally:
+            CAPACITY_OPERATION_LOCK.release()
+
+    return locked_method
+
+
+def serialized_existing_volume_operation(
+        response_type,
+        request_is_ready=None,
+        volume_id_attribute="volume_id",
+        missing_is_conflict=False):
+    """Serialize one existing volume lifecycle across controller replicas."""
+    def decorate(method):
+        @functools.wraps(method)
+        def locked_method(self, request, context):
+            volume_id = getattr(request, volume_id_attribute, "")
+            if (
+                    not is_valid_csi_identifier(volume_id)
+                    or (
+                        request_is_ready is not None
+                        and not request_is_ready(request)
+                    )):
+                return method(self, request, context)
+
+            volume = search_volume(volume_id)
+            if volume is None:
+                return method(self, request, context)
+            hostvol_mnt = os.path.join(HOSTVOL_MOUNTDIR, volume.hostvol)
+            observed_incarnation = volume_incarnation(volume)
+
+            try:
+                operation_lock = (
+                    single_pv_operation_lock
+                    if volume.single_pv_per_pool
+                    else volume_operation_lock
+                )
+                lock_args = (
+                    (hostvol_mnt,)
+                    if volume.single_pv_per_pool
+                    else (hostvol_mnt, volume_id)
+                )
+                with operation_lock(
+                        *lock_args,
+                        timeout=volume_operation_timeout(context)):
+                    locked_volume = search_volume(volume_id)
+                    if locked_volume is None and missing_is_conflict:
+                        raise VolumeOperationConflictError(
+                            "Volume changed while waiting for its lifecycle "
+                            "lock"
+                        )
+                    if (
+                            locked_volume is not None
+                            and locked_volume.hostvol != volume.hostvol):
+                        raise VolumeOperationConflictError(
+                            "Volume hosting pool changed while waiting for "
+                            "its lifecycle lock"
+                        )
+                    if (
+                            locked_volume is not None
+                            and volume_incarnation(locked_volume)
+                            != observed_incarnation):
+                        raise VolumeOperationConflictError(
+                            "Volume was replaced while waiting for its "
+                            "lifecycle lock"
+                        )
+                    return method(self, request, context)
+            except (
+                    VolumeOperationConflictError,
+                    VolumeOperationLockTimeoutError,
+            ) as err:
+                logging.warning(str(err))
+                context.set_details(str(err))
+                context.set_code(grpc.StatusCode.ABORTED)
+                return response_type()
+
+        return locked_method
+    return decorate
+
+
+def valid_expansion_request_shape(request):
+    """Return whether expansion input is ready for a storage lookup."""
+    if not request.HasField("capacity_range"):
+        return False
+    required = request.capacity_range.required_bytes
+    limit = request.capacity_range.limit_bytes
+    return (
+        required >= 0
+        and limit >= 0
+        and (not limit or required <= limit)
+        and (required > 0 or limit > 0)
+    )
+
+
+def valid_creation_request_shape(request):
+    """Return whether create input is ready for a storage lookup."""
+    if not request.volume_capabilities:
+        return False
+    block_volume = (
+        request.parameters.get("pv_type", "").lower() == "block"
+        or is_block_request(request)
+    )
+    if block_volume:
+        single_node_writer = getattr(
+            csi_pb2.VolumeCapability.AccessMode,
+            "SINGLE_NODE_WRITER",
+        )
+        if pvc_access_mode(request) != single_node_writer:
+            return False
+        if get_single_pv_per_pool(request.parameters):
+            return False
+    if not request.HasField("capacity_range"):
+        return True
+    required = request.capacity_range.required_bytes
+    limit = request.capacity_range.limit_bytes
+    return (
+        required >= 0
+        and limit >= 0
+        and (not limit or required <= limit)
+        and (required > 0 or limit > 0)
+    )
+
+
+def volume_operation_timeout(context):
+    """Bound a lifecycle-lock wait by both policy and the RPC deadline."""
+    remaining = None
+    time_remaining = getattr(context, "time_remaining", None)
+    if callable(time_remaining):
+        remaining = time_remaining()
+    if remaining is None:
+        return CAPACITY_LOCK_WAIT_TIMEOUT_SECONDS
+    return min(max(remaining, 0), CAPACITY_LOCK_WAIT_TIMEOUT_SECONDS)
+
+
+@contextmanager
+def volume_creation_identity_lock(volume_id, context):
+    """Serialize one CSI name across processes in the controller pod."""
+    os.makedirs(CREATE_IDENTITY_LOCK_DIR, mode=0o700, exist_ok=True)
+    digest = hashlib.sha256(volume_id.encode("utf-8")).hexdigest()
+    lock_path = os.path.join(CREATE_IDENTITY_LOCK_DIR, f"{digest}.lock")
+    with open(lock_path, "a+b") as lock_file:
+        deadline = time.monotonic() + volume_operation_timeout(context)
+        while True:
+            try:
+                fcntl.flock(
+                    lock_file.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+            except BlockingIOError as err:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise VolumeOperationLockTimeoutError(
+                        "Another create with this volume ID is still in "
+                        "progress"
+                    ) from err
+                time.sleep(min(0.05, remaining))
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def serialized_volume_creation_identity(response_type):
+    """Serialize valid creates before searching the complete pool set.
+
+    Kubernetes renders at most one serving controller pod, and Nomad's sample
+    controller group has count one. The filesystem lock additionally orders
+    multiple driver processes sharing that controller allocation.
+    """
+    def decorate(method):
+        @functools.wraps(method)
+        def locked_method(self, request, context):
+            if (
+                    not is_valid_csi_identifier(request.name)
+                    or not valid_creation_request_shape(request)):
+                return method(self, request, context)
+            try:
+                with volume_creation_identity_lock(request.name, context):
+                    return method(self, request, context)
+            except (
+                    VolumeOperationConflictError,
+                    VolumeOperationLockTimeoutError,
+            ) as err:
+                logging.warning(str(err))
+                context.set_details(str(err))
+                context.set_code(grpc.StatusCode.ABORTED)
+                return response_type()
+
+        return locked_method
+    return decorate
+
+
+def valid_volume_identifier(value, label, context):
+    """Validate an opaque identifier against the CSI string contract."""
+    if is_valid_csi_identifier(value):
+        return True
+
+    errmsg = f"{label} does not satisfy the CSI identifier contract"
+    logging.error(errmsg)
+    context.set_details(errmsg)
+    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+    return False
+
+
+def requested_capacity(capacity, context, default_size=DEFAULT_VOLUME_SIZE):
+    """Validate CSI CapacityRange values before any storage mutation."""
+    if capacity is None:
+        return default_size
+    required = capacity.required_bytes
+    limit = capacity.limit_bytes
+    if required < 0 or limit < 0:
+        errmsg = "Capacity range values must not be negative"
+    elif limit and required > limit:
+        errmsg = "Required bytes must not exceed limit bytes"
+    elif required == 0 and limit == 0:
+        errmsg = "Capacity range must specify required bytes or limit bytes"
+    else:
+        selected = required or limit
+        if selected > 0:
+            return selected
+        errmsg = "Requested capacity must be greater than zero"
+
+    logging.error(errmsg)
+    context.set_details(errmsg)
+    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+    return None
+
+
+def creation_capacity_call(method, *args, volume_id, pvtype):
+    """Call a capacity helper with create identity when it supports it.
+
+    The two-argument fallback preserves compatibility with injected legacy
+    selectors while the in-tree helpers use the identity to make admission and
+    the durable create reservation one cross-process transaction.
+    """
+    parameters = inspect.signature(method).parameters.values()
+    supports_keywords = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    parameter_names = {parameter.name for parameter in parameters}
+    if supports_keywords or {"volume_id", "pvtype"} <= parameter_names:
+        return method(
+            *args,
+            volume_id=volume_id,
+            pvtype=pvtype,
+        )
+    return method(*args)
+
+
+def finish_committed_creation(volume):
+    """Drop a leftover create intent once PV metadata is authoritative."""
+    mntdir = os.path.join(HOSTVOL_MOUNTDIR, volume.hostvol)
+    intent = read_volume_creation_intent(
+        mntdir,
+        volume.volname,
+        volume.voltype,
+        volume.volpath,
+    )
+    if intent is not None:
+        validate_committed_creation(
+            {
+                "incarnation": volume.extra.get("incarnation"),
+                "size": volume.size,
+            },
+            intent,
+        )
+        finish_volume_creation(
+            mntdir,
+            volume.volname,
+            volume.voltype,
+            volume.volpath,
+            intent,
+        )
+
+
+def set_storage_error(context, err):
+    """Translate storage I/O failures into retryable CSI status codes."""
+    transient_errors = {
+        errno.EIO,
+        errno.ENOTCONN,
+        errno.ESTALE,
+        errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+    }
+    context.set_details(f"Storage operation failed: {err}")
+    if isinstance(err, (
+            VolumeOperationConflictError,
+            VolumeOperationLockTimeoutError,
+    )):
+        status = grpc.StatusCode.ABORTED
+    elif isinstance(err, CommandException):
+        status = (
+            grpc.StatusCode.DEADLINE_EXCEEDED
+            if err.ret == 124
+            else grpc.StatusCode.UNAVAILABLE
+        )
+    elif isinstance(err, OSError) and err.errno in transient_errors:
+        status = grpc.StatusCode.UNAVAILABLE
+    else:
+        status = grpc.StatusCode.INTERNAL
+    context.set_code(status)
+
+
+def translate_storage_errors(response_type):
+    """Turn unexpected backend failures into retry-safe CSI responses."""
+    def decorate(method):
+        @functools.wraps(method)
+        def translated(self, request, context):
+            try:
+                return method(self, request, context)
+            except (CommandException, OSError, ValueError) as err:
+                logging.exception("CSI storage operation failed")
+                set_storage_error(context, err)
+                return response_type()
+
+        return translated
+    return decorate
 
 
 # noqa # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -47,31 +451,32 @@ def execute_gluster_quota_command(privkey, user, host, gvolname, path, size):
     if host is None:
         errmsg = "All hosts are not reachable"
         logging.error(logf(errmsg))
-        return errmsg
+        raise CommandException(-1, "reachable_host", errmsg)
 
+    remote_command = shlex.join([
+        "sudo",
+        "gluster",
+        "volume",
+        "quota",
+        str(gvolname),
+        "limit-usage",
+        "/%s" % path,
+        "%s" % size,
+    ])
     quota_cmd = [
         "ssh",
         "-oStrictHostKeyChecking=no",
         "-i",
         "%s" % privkey,
         "%s@%s" % (user, host),
-        "sudo",
-        "gluster",
-        "volume",
-        "quota",
-        "%s" % gvolname,
-        "limit-usage",
-        "/%s" % path,
-        "%s" % size,
+        remote_command,
     ]
     try:
         execute(*quota_cmd)
     except CommandException as err:
         errmsg = "Unable to set Gluster Quota via ssh"
         logging.error(logf(errmsg, error=err))
-        return errmsg
-
-    return None
+        raise
 
 # Assuming multiple volume_capabilities isn't requested
 def is_block_request(request):
@@ -100,6 +505,10 @@ def existing_volume_response(volume):
     }
     if not volume.single_pv_per_pool:
         volume_context["path"] = volume.volpath
+    elif volume.extra.get("single_pv_claim_version") is not None:
+        volume_context["single_pv_claim_version"] = str(
+            volume.extra["single_pv_claim_version"]
+        )
     if volume.extra['hostvoltype'] == "External":
         volume_context.update({
             "gvolname": volume.extra['gvolname'],
@@ -153,6 +562,76 @@ def existing_volume_is_compatible(volume, request, pvtype):
     )
 
 
+def apply_subdir_quota(volume, size, context, update_metadata):
+    """Apply a subvolume quota, optionally committing its new metadata."""
+    mntdir = os.path.join(HOSTVOL_MOUNTDIR, volume.hostvol)
+    use_gluster_quota = (
+        volume.extra['hostvoltype'] == "External"
+        and os.path.isfile("/etc/secret-volume/ssh-privatekey")
+        and "SECRET_GLUSTERQUOTA_SSH_USERNAME" in os.environ
+    )
+
+    if not use_gluster_quota:
+        update_subdir_volume(
+            mntdir,
+            volume.extra['hostvoltype'],
+            volume.volname,
+            size,
+            update_metadata=update_metadata,
+        )
+        return True
+
+    try:
+        execute_gluster_quota_command(
+            "/etc/secret-volume/ssh-privatekey",
+            os.environ.get('SECRET_GLUSTERQUOTA_SSH_USERNAME'),
+            volume.extra['ghost'],
+            volume.extra['gvolname'],
+            volume.volpath,
+            size,
+        )
+    except CommandException as err:
+        set_storage_error(context, err)
+        return False
+
+    if update_metadata:
+        update_pv_metadata(mntdir, volume.volpath, size)
+
+    return True
+
+
+def reconcile_committed_capacity(hostvol, pvname, size):
+    """Make stat.db match durable metadata without a free-space admission."""
+    accounted_size = get_accounted_pv_size(hostvol, pvname)
+    if accounted_size != size:
+        logging.warning(logf(
+            "Repairing PV capacity accounting",
+            hostvol=hostvol,
+            pvname=pvname,
+            accounted_size=accounted_size,
+            committed_size=size,
+        ))
+        update_free_size(hostvol, pvname, -size)
+
+
+def verify_creation_reservation(hostvol, volume_id, pvtype, size):
+    """Require the exact admitted create before mutating pool payload."""
+    reserved = search_volume(volume_id)
+    if reserved is None:
+        raise VolumeOperationConflictError(
+            "Creation reservation disappeared before mutation"
+        )
+    if (
+            reserved.hostvol != hostvol
+            or reserved.voltype != pvtype
+            or reserved.size != size
+            or reserved.extra.get("state") not in (None, "creating")):
+        raise VolumeOperationConflictError(
+            "Creation reservation changed before payload mutation"
+        )
+    return reserved
+
+
 class ControllerServer(csi_pb2_grpc.ControllerServicer):
     """
     ControllerServer object is responsible for handling host
@@ -161,6 +640,15 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
     """
 
     # noqa # pylint: disable=too-many-locals,too-many-statements,too-many-branches
+    @serialized_capacity_operation
+    @translate_storage_errors(csi_pb2.CreateVolumeResponse)
+    @serialized_volume_creation_identity(csi_pb2.CreateVolumeResponse)
+    @serialized_existing_volume_operation(
+        csi_pb2.CreateVolumeResponse,
+        valid_creation_request_shape,
+        volume_id_attribute="name",
+        missing_is_conflict=True,
+    )
     def CreateVolume(self, request, context):
         start_time = time.time()
         logging.debug(logf(
@@ -168,11 +656,7 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             request=request
         ))
 
-        if not request.name:
-            errmsg = "Volume name is empty and must be provided"
-            logging.error(errmsg)
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        if not valid_volume_identifier(request.name, "Volume name", context):
             return csi_pb2.CreateVolumeResponse()
 
         if not request.volume_capabilities:
@@ -182,7 +666,14 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return csi_pb2.CreateVolumeResponse()
 
-        pvsize = request.capacity_range.required_bytes
+        capacity = (
+            request.capacity_range
+            if request.HasField("capacity_range")
+            else None
+        )
+        pvsize = requested_capacity(capacity, context)
+        if pvsize is None:
+            return csi_pb2.CreateVolumeResponse()
 
         pvtype = PV_TYPE_SUBVOL
         is_block = False
@@ -212,12 +703,62 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 return csi_pb2.CreateVolumeResponse()
 
+        single_pv_per_pool = get_single_pv_per_pool(request.parameters)
+        if single_pv_per_pool and pvtype != PV_TYPE_SUBVOL:
+            errmsg = "single_pv_per_pool supports filesystem volumes only"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return csi_pb2.CreateVolumeResponse()
+
         # CreateVolume is idempotent: retrying a compatible request must return
         # the original volume without selecting another pool or charging space
         # a second time.
-        volume = search_volume(request.name)
-        if volume:
+        try:
+            volume = search_volume(request.name)
+        except (CommandException, OSError, ValueError) as err:
+            set_storage_error(context, err)
+            return csi_pb2.CreateVolumeResponse()
+        pending_creation = None
+        if volume and volume.extra.get("state") == "creating":
+            if not existing_volume_is_compatible(volume, request, pvtype):
+                errmsg = "A pending create with this name is incompatible"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+                return csi_pb2.CreateVolumeResponse()
+            pending_creation = volume
+            # The durable intent selected the exact size on the original call.
+            # A compatible CapacityRange retry resumes that same allocation.
+            pvsize = volume.size
+        elif volume:
+            if volume.extra.get("state") in (
+                    "archiving", "deleting", "reclaiming"):
+                errmsg = "Volume deletion is still in progress"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.CreateVolumeResponse()
+            if (
+                    volume.single_pv_per_pool
+                    and volume.extra.get("single_pv_claim_state") != "active"):
+                errmsg = "Single-PV pool is being deleted or is retired"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.CreateVolumeResponse()
             if existing_volume_is_compatible(volume, request, pvtype):
+                # A prior request can create the PV metadata and then fail
+                # while updating stat.db. Reconcile the absolute-size record
+                # on retries; update_pv_record uses INSERT OR REPLACE, so this
+                # repairs interrupted creates without adding the size twice.
+                if not volume.single_pv_per_pool:
+                    finish_committed_creation(volume)
+                    reconcile_committed_capacity(
+                        volume.hostvol,
+                        volume.volname,
+                        volume.size,
+                    )
                 return existing_volume_response(volume)
 
             errmsg = "A volume with this name already exists incompatibly"
@@ -254,17 +795,57 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             "Got list of hosting Volumes",
             volumes=",".join(v['name'] for v in host_volumes)
         ))
-        hostvol = None
+        hostvol = (
+            pending_creation.hostvol
+            if pending_creation is not None
+            else None
+        )
         ext_volume = None
         data = {}
-        hostvoltype = filters.get("hostvol_type", None)
+        hostvoltype = (
+            pending_creation.extra.get("hostvoltype")
+            if pending_creation is not None
+            else filters.get("hostvol_type", None)
+        )
+        if pending_creation is not None and not any(
+                item["name"] == pending_creation.hostvol
+                for item in host_volumes):
+            errmsg = "Pending create belongs to an incompatible storage pool"
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+            return csi_pb2.CreateVolumeResponse()
         if not hostvoltype:
             # This means, the request came on 'kadalu' storage class type.
 
             # Randomize the entries so we can issue PV from different storage
             random.shuffle(host_volumes)
 
-            hostvol = mount_and_select_hosting_volume(host_volumes, pvsize)
+            try:
+                if single_pv_per_pool:
+                    hostvol, pvsize = mount_single_pv_hosting_volume(
+                        host_volumes,
+                        pvsize,
+                        request.capacity_range.limit_bytes,
+                    )
+                else:
+                    hostvol = creation_capacity_call(
+                        mount_and_select_hosting_volume,
+                        host_volumes,
+                        pvsize,
+                        volume_id=request.name,
+                        pvtype=pvtype,
+                    )
+            except UnsupportedCapacityRangeError as err:
+                context.set_details(str(err))
+                context.set_code(grpc.StatusCode.OUT_OF_RANGE)
+                return csi_pb2.CreateVolumeResponse()
+            except LegacySinglePVPoolUnclaimedError as err:
+                context.set_details(str(err))
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.CreateVolumeResponse()
+            except (CommandException, OSError, ValueError) as err:
+                set_storage_error(context, err)
+                return csi_pb2.CreateVolumeResponse()
             if hostvol is None:
                 errmsg = "No Hosting Volumes available, add more storage"
                 logging.error(errmsg)
@@ -278,9 +859,26 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
 
             hostvoltype = data['type']
 
-        single_pv_per_pool = get_single_pv_per_pool(filters)
         if hostvoltype == 'External':
-            ext_volume = check_external_volume(request, host_volumes)
+            external_candidates = host_volumes
+            if pending_creation is not None:
+                # The durable intent already selected this exact pool. Restrict
+                # discovery before it mounts anything so a retry can never move
+                # an interrupted create to an equivalent external pool.
+                external_candidates = [
+                    item for item in host_volumes
+                    if item["name"] == pending_creation.hostvol
+                ]
+            ext_volume = check_external_volume(request, external_candidates)
+
+            if (
+                    pending_creation is not None
+                    and ext_volume is not None
+                    and ext_volume["name"] != pending_creation.hostvol):
+                errmsg = "Pending create cannot switch external storage pools"
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.CreateVolumeResponse()
 
             if ext_volume:
                 mntdir = os.path.join(HOSTVOL_MOUNTDIR, ext_volume['name'])
@@ -291,8 +889,55 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                     # If 'single_pv_per_pool' is True, the request will be
                     # considered as to map 1 PV to 1 Gluster volume
 
-                    # No need to keep the mount on controller
-                    unmount_glusterfs(mntdir,ext_volume['g_volname'])
+                    try:
+                        _, pvsize = mount_single_pv_hosting_volume(
+                            [ext_volume],
+                            pvsize,
+                            (
+                                request.capacity_range.limit_bytes
+                                if request.HasField("capacity_range")
+                                else 0
+                            ),
+                        )
+                        claim_single_pv_volume(
+                            mntdir,
+                            request.name,
+                            pvsize,
+                        )
+                    except UnsupportedCapacityRangeError as err:
+                        context.set_details(str(err))
+                        context.set_code(grpc.StatusCode.OUT_OF_RANGE)
+                        return csi_pb2.CreateVolumeResponse()
+                    except LegacySinglePVPoolUnclaimedError as err:
+                        context.set_details(str(err))
+                        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                        return csi_pb2.CreateVolumeResponse()
+                    except SinglePVPoolClaimedError as err:
+                        errmsg = (
+                            "Single-PV pool already belongs to volume "
+                            f"{err}"
+                        )
+                        context.set_details(errmsg)
+                        context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+                        return csi_pb2.CreateVolumeResponse()
+                    except SinglePVPoolRetiredError:
+                        errmsg = (
+                            "Deleted single-PV pool requires administrator "
+                            "reset before it can be reused"
+                        )
+                        context.set_details(errmsg)
+                        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                        return csi_pb2.CreateVolumeResponse()
+                    except SinglePVPoolNotEmptyError as err:
+                        context.set_details(str(err))
+                        context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                        return csi_pb2.CreateVolumeResponse()
+                    except (OSError, ValueError) as err:
+                        set_storage_error(context, err)
+                        return csi_pb2.CreateVolumeResponse()
+                    finally:
+                        # No need to keep the dedicated mount on controller.
+                        unmount_glusterfs(mntdir, ext_volume['g_volname'])
 
                     logging.info(logf(
                         "Volume (External) created",
@@ -319,13 +964,22 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                                 "fstype": "xfs",
                                 "options": ext_volume['g_options'],
                                 "single_pv_per_pool": f"{single_pv_per_pool}",
+                                "single_pv_claim_version": "1",
                             }
                         }
                     )
 
                 # The external volume should be used as kadalu host vol
 
-                if not is_hosting_volume_free(ext_volume['name'], pvsize):
+                if (
+                        pending_creation is None
+                        and not creation_capacity_call(
+                            is_hosting_volume_free,
+                            ext_volume['name'],
+                            pvsize,
+                            volume_id=request.name,
+                            pvtype=pvtype,
+                        )):
 
                     logging.error(logf(
                         "Hosting volume is full. Add more storage",
@@ -336,39 +990,101 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                     context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
                     return csi_pb2.CreateVolumeResponse()
 
-                if pvtype in [PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK]:
-                    vol = create_block_volume(
-                        pvtype, mntdir, request.name, pvsize)
-                else:
-                    use_gluster_quota = False
-                    if (os.path.isfile("/etc/secret-volume/ssh-privatekey") \
-                        and "SECRET_GLUSTERQUOTA_SSH_USERNAME" in os.environ):
-                        use_gluster_quota = True
-                    secret_private_key = "/etc/secret-volume/ssh-privatekey"
-                    secret_username = os.environ.get('SECRET_GLUSTERQUOTA_SSH_USERNAME', None)
-                    hostname = filters.get("gluster_hosts", None)
-                    gluster_vol_name = filters.get("gluster_volname", None)
-                    vol = create_subdir_volume(
+                with volume_operation_lock(
                         mntdir,
                         request.name,
+                        timeout=volume_operation_timeout(context)):
+                    verify_creation_reservation(
+                        ext_volume['name'],
+                        request.name,
+                        pvtype,
                         pvsize,
-                        use_gluster_quota,
-                        save_metadata=not use_gluster_quota,
                     )
-                    quota_size = pvsize
-                    quota_path = vol.volpath
-                    if use_gluster_quota is False:
-                        logging.debug(logf("Set Quota in the native way"))
+                    if pvtype in [PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK]:
+                        vol = create_block_volume(
+                            pvtype, mntdir, request.name, pvsize)
                     else:
-                        logging.debug(logf("Set Quota using gluster directory Quota"))
-                        errmsg = execute_gluster_quota_command(
-                            secret_private_key, secret_username, hostname,
-                            gluster_vol_name, quota_path, quota_size)
-                        if errmsg:
-                            context.set_details(errmsg)
-                            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                            return csi_pb2.CreateVolumeResponse()
-                        save_pv_metadata(mntdir, vol.volpath, pvsize)
+                        use_gluster_quota = False
+                        if (
+                                os.path.isfile(
+                                    "/etc/secret-volume/ssh-privatekey"
+                                )
+                                and "SECRET_GLUSTERQUOTA_SSH_USERNAME"
+                                in os.environ):
+                            use_gluster_quota = True
+                        secret_private_key = (
+                            "/etc/secret-volume/ssh-privatekey"
+                        )
+                        secret_username = os.environ.get(
+                            'SECRET_GLUSTERQUOTA_SSH_USERNAME',
+                            None,
+                        )
+                        hostname = filters.get("gluster_hosts", None)
+                        gluster_vol_name = filters.get(
+                            "gluster_volname",
+                            None,
+                        )
+                        vol = create_subdir_volume(
+                            mntdir,
+                            request.name,
+                            pvsize,
+                            use_gluster_quota,
+                            save_metadata=not use_gluster_quota,
+                        )
+                        quota_size = pvsize
+                        quota_path = vol.volpath
+                        if use_gluster_quota is False:
+                            logging.debug(logf(
+                                "Set Quota in the native way"
+                            ))
+                        else:
+                            logging.debug(logf(
+                                "Set Quota using gluster directory Quota"
+                            ))
+                            execute_gluster_quota_command(
+                                secret_private_key,
+                                secret_username,
+                                hostname,
+                                gluster_vol_name,
+                                quota_path,
+                                quota_size,
+                            )
+                            creation_intent = read_volume_creation_intent(
+                                mntdir,
+                                vol.volname,
+                                vol.voltype,
+                                vol.volpath,
+                            )
+                            if creation_intent is None:
+                                raise VolumeOperationConflictError(
+                                    "Creation reservation disappeared before "
+                                    "metadata commit"
+                                )
+                            save_pv_metadata(
+                                mntdir,
+                                vol.volpath,
+                                pvsize,
+                                incarnation=creation_intent.get(
+                                    "incarnation"
+                                ),
+                            )
+                            finish_volume_creation(
+                                mntdir,
+                                vol.volname,
+                                vol.voltype,
+                                vol.volpath,
+                                creation_intent,
+                            )
+
+                    # Keep metadata and its absolute accounting record under
+                    # the same lifecycle lock as payload creation. A delete
+                    # can never finish between these two commits.
+                    update_free_size(
+                        ext_volume['name'],
+                        request.name,
+                        -pvsize,
+                    )
+
                 logging.info(logf(
                     "Volume created",
                     name=request.name,
@@ -415,7 +1131,13 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             # Randomize the entries so we can issue PV from different storage
             random.shuffle(host_volumes)
 
-            hostvol = mount_and_select_hosting_volume(host_volumes, pvsize)
+            hostvol = creation_capacity_call(
+                mount_and_select_hosting_volume,
+                host_volumes,
+                pvsize,
+                volume_id=request.name,
+                pvtype=pvtype,
+            )
             if hostvol is None:
                 errmsg = "No Hosting Volumes available, add more storage"
                 logging.error(errmsg)
@@ -427,6 +1149,35 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             # Then mount the whole volume as PV
             msg = "non-native way of Kadalu mount expected"
             logging.info(msg)
+            try:
+                claim_single_pv_volume(
+                    os.path.join(HOSTVOL_MOUNTDIR, hostvol),
+                    request.name,
+                    pvsize,
+                )
+            except SinglePVPoolClaimedError as err:
+                errmsg = (
+                    "Single-PV pool already belongs to volume "
+                    f"{err}"
+                )
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+                return csi_pb2.CreateVolumeResponse()
+            except SinglePVPoolRetiredError:
+                errmsg = (
+                    "Deleted single-PV pool requires administrator reset "
+                    "before it can be reused"
+                )
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.CreateVolumeResponse()
+            except SinglePVPoolNotEmptyError as err:
+                context.set_details(str(err))
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.CreateVolumeResponse()
+            except (OSError, ValueError) as err:
+                set_storage_error(context, err)
+                return csi_pb2.CreateVolumeResponse()
             return csi_pb2.CreateVolumeResponse(
                 volume={
                     "volume_id": request.name,
@@ -436,19 +1187,33 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                         "hostvol": hostvol,
                         "pvtype": pvtype,
                         "fstype": "xfs",
-                        "single_pv_per_pool": f"{single_pv_per_pool}",
+                            "single_pv_per_pool": f"{single_pv_per_pool}",
                     }
                 }
             )
 
         mntdir = os.path.join(HOSTVOL_MOUNTDIR, hostvol)
-        if pvtype in [PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK]:
-            vol = create_block_volume(
-                pvtype, mntdir, request.name, pvsize)
-        else:
-            use_gluster_quota = False
-            vol = create_subdir_volume(
-                mntdir, request.name, pvsize, use_gluster_quota)
+        with volume_operation_lock(
+                mntdir,
+                request.name,
+                timeout=volume_operation_timeout(context)):
+            verify_creation_reservation(
+                hostvol,
+                request.name,
+                pvtype,
+                pvsize,
+            )
+            if pvtype in [PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK]:
+                vol = create_block_volume(
+                    pvtype, mntdir, request.name, pvsize)
+            else:
+                use_gluster_quota = False
+                vol = create_subdir_volume(
+                    mntdir, request.name, pvsize, use_gluster_quota)
+
+            # Keep metadata and its absolute accounting record under the same
+            # lifecycle lock as payload creation and quota initialization.
+            update_free_size(hostvol, request.name, -pvsize)
         logging.info(logf(
             "Volume created",
             name=request.name,
@@ -458,8 +1223,6 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             volpath=vol.volpath,
             duration_seconds=time.time() - start_time
         ))
-
-        update_free_size(hostvol, request.name, -pvsize)
 
         send_analytics_tracker("pvc-%s" % hostvoltype, uid)
 
@@ -477,18 +1240,30 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 }
             })
 
-
+    @serialized_capacity_operation
+    @translate_storage_errors(csi_pb2.DeleteVolumeResponse)
     def DeleteVolume(self, request, context):
         start_time = time.time()
 
-        if not request.volume_id:
-            errmsg = "Volume ID is empty and must be provided"
-            logging.error(errmsg)
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        if not valid_volume_identifier(request.volume_id, "Volume ID", context):
             return csi_pb2.DeleteVolumeResponse()
 
-        delete_volume(request.volume_id)
+        try:
+            delete_volume(
+                request.volume_id,
+                lock_timeout=volume_operation_timeout(context),
+            )
+        except UnsupportedReclaimPolicyError as err:
+            context.set_details(str(err))
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return csi_pb2.DeleteVolumeResponse()
+        except CommandException as err:
+            context.set_details(f"Storage operation failed: {err}")
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            return csi_pb2.DeleteVolumeResponse()
+        except (OSError, ValueError) as err:
+            set_storage_error(context, err)
+            return csi_pb2.DeleteVolumeResponse()
         logging.info(logf(
             "Delete Volume response completed",
             name=request.volume_id,
@@ -496,16 +1271,14 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
         ))
         return csi_pb2.DeleteVolumeResponse()
 
+    @translate_storage_errors(csi_pb2.ValidateVolumeCapabilitiesResponse)
     def ValidateVolumeCapabilities(self, request, context):
 
-        if not request.volume_id:
-            errmsg = "Volume ID is empty and must be provided"
-            logging.error(errmsg)
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        if not valid_volume_identifier(request.volume_id, "Volume ID", context):
             return csi_pb2.ValidateVolumeCapabilitiesResponse()
 
-        if not search_volume(request.volume_id):
+        volume = search_volume(request.volume_id)
+        if not volume or volume.extra.get("state") == "creating":
             errmsg = "Requested volume does not exist"
             logging.error(errmsg)
             context.set_details(errmsg)
@@ -553,6 +1326,7 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
 
 
 
+    @translate_storage_errors(csi_pb2.ListVolumesResponse)
     def ListVolumes(self, request, context):
         """Returns list of all PVCs with sizes existing in Kadalu Storage"""
 
@@ -643,6 +1417,12 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             ]
         )
 
+    @serialized_capacity_operation
+    @translate_storage_errors(csi_pb2.ControllerExpandVolumeResponse)
+    @serialized_existing_volume_operation(
+        csi_pb2.ControllerExpandVolumeResponse,
+        valid_expansion_request_shape,
+    )
     def ControllerExpandVolume(self, request, context):
         """
         Controller plugin RPC call implementation of EXPAND_VOLUME
@@ -654,31 +1434,29 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             request=request
         ))
 
-        if not request.volume_id:
-            errmsg = "Volume ID is empty and must be provided"
-            logging.error(errmsg)
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        if not valid_volume_identifier(request.volume_id, "Volume ID", context):
             return csi_pb2.ControllerExpandVolumeResponse()
 
-        if not request.capacity_range:
+        if not request.HasField("capacity_range"):
             errmsg = "Capacity Range is empty and must be provided"
             logging.error(errmsg)
             context.set_details(errmsg)
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return csi_pb2.ControllerExpandVolumeResponse()
 
-        if not request.capacity_range.required_bytes:
-            errmsg = "Required Bytes is empty and must be provided"
-            logging.error(errmsg)
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        expansion_requested_pvsize = requested_capacity(
+            request.capacity_range,
+            context,
+        )
+        if expansion_requested_pvsize is None:
             return csi_pb2.ControllerExpandVolumeResponse()
 
-        expansion_requested_pvsize = request.capacity_range.required_bytes
-
         # Get existing volume
-        existing_volume = search_volume(request.volume_id)
+        try:
+            existing_volume = search_volume(request.volume_id)
+        except (CommandException, OSError, ValueError) as err:
+            set_storage_error(context, err)
+            return csi_pb2.ControllerExpandVolumeResponse()
         if not existing_volume:
             errmsg = logf(
                 "Unable to find volume",
@@ -686,26 +1464,60 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             )
             logging.error(errmsg)
             context.set_details(str(errmsg))
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return csi_pb2.ControllerExpandVolumeResponse()
+        volume_state = existing_volume.extra.get("state")
+        if volume_state is not None:
+            errmsg = (
+                "Requested volume has an incomplete lifecycle transition: "
+                f"{volume_state}"
+            )
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return csi_pb2.ControllerExpandVolumeResponse()
+        if (
+                existing_volume.single_pv_per_pool
+                and existing_volume.extra.get("single_pv_claim_state")
+                != "active"):
+            errmsg = "Single-PV pool is being deleted or is retired"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
             return csi_pb2.ControllerExpandVolumeResponse()
 
         existing_pvsize = existing_volume.size
-        pvname = existing_volume.volname
-
-        # Expansion is idempotent and must never shrink an existing volume.
-        if expansion_requested_pvsize <= existing_pvsize:
-            logging.info(logf(
-                "Volume already satisfies requested capacity",
-                existing_pvsize=existing_pvsize,
-                expansion_requested_pvsize=expansion_requested_pvsize,
-                volume=pvname,
-            ))
+        if (
+                not isinstance(existing_pvsize, int)
+                or isinstance(existing_pvsize, bool)
+                or existing_pvsize <= 0):
+            set_storage_error(
+                context,
+                ValueError("Volume metadata contains an invalid size"),
+            )
+            return csi_pb2.ControllerExpandVolumeResponse()
+        if (
+                request.capacity_range.limit_bytes
+                and existing_pvsize > request.capacity_range.limit_bytes):
+            errmsg = "Existing volume exceeds the requested capacity limit"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.OUT_OF_RANGE)
             return csi_pb2.ControllerExpandVolumeResponse(
                 capacity_bytes=int(existing_pvsize),
                 node_expansion_required=False,
             )
+        pvname = existing_volume.volname
+        hostvol = existing_volume.hostvol
+        mntdir = os.path.join(HOSTVOL_MOUNTDIR, hostvol)
 
-        if existing_volume.single_pv_per_pool:
+        # Expansion is idempotent and must never shrink an existing volume.
+        # A stale smaller request still reconciles the existing absolute size,
+        # repairing any interrupted quota or accounting update without using
+        # the stale requested size.
+        if (
+                expansion_requested_pvsize > existing_pvsize
+                and existing_volume.single_pv_per_pool):
             errmsg = "PV with single_pv_per_pool doesn't support expansion"
             logging.error(errmsg)
             context.set_details(errmsg)
@@ -715,7 +1527,12 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 node_expansion_required=False,
             )
 
-        if existing_volume.voltype in (PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK):
+        if (
+                expansion_requested_pvsize > existing_pvsize
+                and existing_volume.voltype in (
+                    PV_TYPE_VIRTBLOCK,
+                    PV_TYPE_RAWBLOCK,
+                )):
             errmsg = (
                 "Block volume expansion is unavailable until node-side "
                 "loop-device and filesystem growth is implemented"
@@ -728,12 +1545,96 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 node_expansion_required=False,
             )
 
-        additional_pvsize_required = expansion_requested_pvsize - existing_pvsize
+        pending_expansion = None
+        if (
+                not existing_volume.single_pv_per_pool
+                and existing_volume.voltype == PV_TYPE_SUBVOL):
+            pending_expansion = read_volume_expansion_intent(
+                mntdir,
+                pvname,
+                existing_volume.voltype,
+                existing_volume.volpath,
+            )
+            if pending_expansion is not None and (
+                    expansion_requested_pvsize
+                    != pending_expansion["to_size"]):
+                errmsg = "Request does not match the pending expansion target"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.ControllerExpandVolumeResponse(
+                    capacity_bytes=int(existing_pvsize),
+                    node_expansion_required=False,
+                )
+            if (
+                    pending_expansion is not None
+                    and existing_pvsize not in (
+                        pending_expansion["from_size"],
+                        pending_expansion["to_size"],
+                    )):
+                raise ValueError(
+                    "Pending expansion does not match committed metadata"
+                )
+
+        if not existing_volume.single_pv_per_pool:
+            # Metadata records the committed allocation. stat.db is a
+            # rebuildable index and must be repaired even if the pool is now
+            # overcommitted, otherwise subsequent admission sees false space.
+            reconcile_committed_capacity(
+                hostvol,
+                pvname,
+                (
+                    pending_expansion["to_size"]
+                    if pending_expansion is not None
+                    else existing_pvsize
+                ),
+            )
+
+        if (
+                pending_expansion is None
+                and expansion_requested_pvsize <= existing_pvsize):
+            # Metadata is committed only after quota, but the process can still
+            # fail before stat.db is updated. Reapplying an absolute quota and
+            # accounting record makes a retry repair either legacy
+            # ordering or that interrupted final step.
+            if (
+                    not existing_volume.single_pv_per_pool
+                    and existing_volume.voltype == PV_TYPE_SUBVOL):
+                if not apply_subdir_quota(
+                        existing_volume,
+                        existing_pvsize,
+                        context,
+                        update_metadata=False):
+                    return csi_pb2.ControllerExpandVolumeResponse(
+                        capacity_bytes=int(existing_pvsize),
+                        node_expansion_required=False,
+                    )
+            logging.info(logf(
+                "Reconciled volume at requested capacity",
+                size=existing_pvsize,
+                volume=pvname,
+            ))
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
+            )
+
+        target_size = (
+            pending_expansion["to_size"]
+            if pending_expansion is not None
+            else expansion_requested_pvsize
+        )
+        from_size = (
+            pending_expansion["from_size"]
+            if pending_expansion is not None
+            else existing_pvsize
+        )
+        additional_pvsize_required = target_size - from_size
 
         logging.info(logf(
             "Existing PV size and Expansion requested PV size",
             existing_pvsize=existing_pvsize,
-            expansion_requested_pvsize=expansion_requested_pvsize,
+            expansion_requested_pvsize=target_size,
             additional_size_required=additional_pvsize_required
         ))
 
@@ -746,80 +1647,61 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             capability=request.volume_capability
         ))
 
-        hostvol = existing_volume.hostvol
-        mntdir = os.path.join(HOSTVOL_MOUNTDIR, hostvol)
-        use_gluster_quota = False
-
-        # Check free-size in storage-pool before expansion
-        if not is_hosting_volume_free(hostvol, additional_pvsize_required):
-
+        pending_expansion = reserve_volume_expansion(
+            hostvol,
+            pvname,
+            (
+                existing_volume.voltype,
+                existing_volume.volpath,
+                from_size,
+                target_size,
+            ),
+        )
+        if pending_expansion is None:
+            context.set_details("Host volume resource is exhausted")
+            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
             logging.error(logf(
                 "Hosting volume is full. Add more storage",
                 volume=hostvol
             ))
-            errmsg = "Host volume resource is exhausted"
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
             return csi_pb2.ControllerExpandVolumeResponse(
                 capacity_bytes=int(existing_pvsize),
                 node_expansion_required=False,
             )
 
-        hostvoltype = existing_volume.extra['hostvoltype']
-
-        if hostvoltype == 'External':
-            # Use Gluster quota if set
-            if (os.path.isfile("/etc/secret-volume/ssh-privatekey") \
-                and "SECRET_GLUSTERQUOTA_SSH_USERNAME" in os.environ):
-                use_gluster_quota = True
-
-        # Can be true only if its 'External'
-        if use_gluster_quota:
-            secret_private_key = "/etc/secret-volume/ssh-privatekey"
-            secret_username = os.environ.get('SECRET_GLUSTERQUOTA_SSH_USERNAME', None)
-
-            logging.debug(logf("Set Quota (expand) using gluster directory Quota"))
-            errmsg = execute_gluster_quota_command(
-                secret_private_key, secret_username, existing_volume.extra['ghost'],
-                existing_volume.extra['gvolname'], existing_volume.volpath,
-                expansion_requested_pvsize)
-            if errmsg:
-                context.set_details(errmsg)
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                return csi_pb2.ControllerExpandVolumeResponse(
-                    capacity_bytes=int(existing_pvsize),
-                    node_expansion_required=False,
-                )
-            update_pv_metadata(
-                mntdir,
-                existing_volume.volpath,
-                expansion_requested_pvsize,
-            )
-        else:
-            update_subdir_volume(
-                mntdir,
-                hostvoltype,
-                pvname,
-                expansion_requested_pvsize,
+        if not apply_subdir_quota(
+                existing_volume,
+                target_size,
+                context,
+                update_metadata=True):
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
             )
 
         logging.info(logf(
             "Volume expanded",
             name=pvname,
-            size=expansion_requested_pvsize,
+            size=target_size,
             hostvol=hostvol,
             pvtype=pvtype,
             volpath=existing_volume.volpath,
             duration_seconds=time.time() - start_time
         ))
 
-        update_free_size(hostvol, pvname, -expansion_requested_pvsize)
+        finish_volume_expansion(
+            mntdir,
+            pvname,
+            existing_volume.voltype,
+            existing_volume.volpath,
+            pending_expansion,
+        )
 
         # if not hostvoltype:
         #     hostvoltype = "unknown"
 
         # send_analytics_tracker("pvc-%s" % hostvoltype, uid)
         return csi_pb2.ControllerExpandVolumeResponse(
-            capacity_bytes=int(expansion_requested_pvsize),
+            capacity_bytes=int(target_size),
             node_expansion_required=False,
         )

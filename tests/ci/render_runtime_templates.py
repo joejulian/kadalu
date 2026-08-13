@@ -70,6 +70,7 @@ def runtime_manifests():
             "storageclass-kadalu.custom.yaml.j2",
             hostvol_name="bellagio-vault",
             single_pv_per_pool=False,
+            reclaim_policy="Delete",
         ),
         render(
             "external-storageclass.yaml.j2",
@@ -78,6 +79,7 @@ def runtime_manifests():
             gluster_volname="mirage",
             gluster_options="log-level=WARNING",
             single_pv_per_pool=False,
+            reclaim_policy="Delete",
         ),
         render("csi-driver-object-v1.yaml.j2"),
         render(

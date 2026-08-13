@@ -1,5 +1,6 @@
 """Utility functions"""
 
+import base64
 import errno
 import logging
 import os
@@ -10,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 
 import xxhash
 
@@ -34,6 +36,8 @@ PV_TYPE_SUBVOL = "subvol"
 PV_TYPE_RAWBLOCK = "rawblock"
 
 KADALU_VERSION = os.environ.get("KADALU_VERSION", "latest")
+COMMAND_TIMEOUT_SECONDS = 120
+COMMAND_TERMINATION_GRACE_SECONDS = 5
 
 
 class TimeoutOSError(OSError):
@@ -61,7 +65,8 @@ def retry_errors(func, args, errors, timeout=130, interval=2):
             raise
 
 
-def _is_gluster_process(args, volname, mountpoint):
+# pylint: disable=too-many-return-statements
+def _is_gluster_process(args, volname, mountpoint, mount_identity=None):
     """Return whether an argument vector is the requested Gluster client."""
     if not args or os.path.basename(args[0]) != "glusterfs":
         return False
@@ -75,6 +80,17 @@ def _is_gluster_process(args, volname, mountpoint):
             volfile_index + 1 >= len(args)
             or args[volfile_index + 1] != volname):
         return False
+
+    if mount_identity is not None:
+        try:
+            display_index = args.index("--fs-display-name")
+        except ValueError:
+            return False
+        expected_display_name = f"kadalu:{volname}:{mount_identity}"
+        if (
+                display_index + 1 >= len(args)
+                or args[display_index + 1] != expected_display_name):
+            return False
     if args[-1] == mountpoint:
         return True
 
@@ -86,7 +102,7 @@ def _is_gluster_process(args, volname, mountpoint):
     return display_index + 2 < len(args) and args[display_index + 2] == mountpoint
 
 
-def is_gluster_mount_proc_running(volname, mountpoint):
+def is_gluster_mount_proc_running(volname, mountpoint, mount_identity=None):
     """Check whether the requested Gluster client process is running."""
     for proc_entry in os.scandir("/proc"):
         if not proc_entry.name.isdigit():
@@ -103,7 +119,7 @@ def is_gluster_mount_proc_running(volname, mountpoint):
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
 
-        if _is_gluster_process(args, volname, mountpoint):
+        if _is_gluster_process(args, volname, mountpoint, mount_identity):
             return True
 
     return False
@@ -267,17 +283,131 @@ def get_volname_hash(volname):
     return xxhash.xxh64_hexdigest(volname)
 
 
+def is_safe_path_component(value):
+    """Return whether a CSI identifier is one safe filesystem component."""
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        return False
+    try:
+        if len(value.encode("utf-8")) > 128:
+            return False
+    except UnicodeEncodeError:
+        return False
+    return not (
+        "/" in value
+        or "\0" in value
+        or any(ord(character) < 32 or ord(character) == 127
+               for character in value)
+    )
+
+
+def is_valid_csi_identifier(value):
+    """Return whether a value satisfies the CSI opaque-name contract."""
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        if len(value.encode("utf-8")) > 128:
+            return False
+    except UnicodeEncodeError:
+        return False
+
+    return not any(
+        ord(character) <= 0x08
+        or ord(character) in (0x0B, 0x0C)
+        or 0x0E <= ord(character) <= 0x1F
+        or 0x7F <= ord(character) <= 0x9F
+        for character in value
+    )
+
+
+VOLUME_COMPONENT_ENCODING_PREFIX = ".kadalu~"
+VOLUME_LAYOUT_V2_DIR = ".kadalu-v2"
+
+
+def volume_name_component(volname):
+    """Encode an opaque CSI name as one collision-free path component."""
+    if not is_valid_csi_identifier(volname):
+        raise ValueError("volume name does not satisfy the CSI identifier contract")
+    if (
+            is_safe_path_component(volname)
+            and not volname.startswith(VOLUME_COMPONENT_ENCODING_PREFIX)):
+        return volname
+
+    encoded = base64.urlsafe_b64encode(
+        volname.encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"{VOLUME_COMPONENT_ENCODING_PREFIX}{encoded}"
+
+
+def volume_name_from_component(component):
+    """Decode a component produced by :func:`volume_name_component`."""
+    if not isinstance(component, str):
+        raise ValueError("volume component must be a string")
+    if not component.startswith(VOLUME_COMPONENT_ENCODING_PREFIX):
+        return component
+
+    encoded = component[len(VOLUME_COMPONENT_ENCODING_PREFIX):]
+    if not encoded:
+        raise ValueError("encoded volume component is empty")
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        decoded = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        ).decode("utf-8")
+    except (UnicodeDecodeError, ValueError) as err:
+        raise ValueError("encoded volume component is invalid") from err
+    if (
+            not is_valid_csi_identifier(decoded)
+            or volume_name_component(decoded) != component):
+        raise ValueError("encoded volume component is not canonical")
+    return decoded
+
+
 def get_volume_path(voltype, volhash, volname):
-    """Volume path based on hash"""
+    """Return the canonical, path-safe location for an opaque CSI name."""
+    component = volume_name_component(volname)
+    if component.startswith(VOLUME_COMPONENT_ENCODING_PREFIX):
+        # Keep encoded names in a layout which old raw-name releases could
+        # never produce. Otherwise a deliberately chosen opaque ID could share
+        # both a 16-bit hash bucket and component with a legacy raw volume ID.
+        return "%s/%s/%s/%s/%s" % (
+            voltype,
+            VOLUME_LAYOUT_V2_DIR,
+            volhash[0:2],
+            volhash[2:4],
+            component,
+        )
     return "%s/%s/%s/%s" % (
         voltype,
         volhash[0:2],
         volhash[2:4],
-        volname
+        component,
     )
 
 
-def execute(*cmd,shell=False):
+def get_legacy_volume_path(voltype, volhash, volname):
+    """Return an old raw-name path only for one legacy-safe component."""
+    if not is_valid_csi_identifier(volname):
+        raise ValueError("volume name does not satisfy the CSI identifier contract")
+    if not is_safe_path_component(volname):
+        return None
+
+    bucket = os.path.normpath("%s/%s/%s" % (
+        voltype,
+        volhash[0:2],
+        volhash[2:4],
+    ))
+    candidate = os.path.normpath(os.path.join(bucket, volname))
+    try:
+        if os.path.commonpath((candidate, bucket)) != bucket or candidate == bucket:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def execute(*cmd, shell=False, timeout=COMMAND_TIMEOUT_SECONDS):
     """
     Execute command. Returns output and error.
     Raises CommandException on error
@@ -287,8 +417,29 @@ def execute(*cmd,shell=False):
                           stdout=subprocess.PIPE,
                           shell=shell,
                           cwd=None,
+                          start_new_session=True,
                           universal_newlines=True) as proc:
-        out, err = proc.communicate()
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                out, err = proc.communicate(
+                    timeout=COMMAND_TERMINATION_GRACE_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                out, err = proc.communicate()
+            timeout_error = f"command timed out after {timeout} seconds"
+            if err.strip():
+                timeout_error = f"{timeout_error}: {err.strip()}"
+            raise CommandException(124, out.strip(), timeout_error) from None
         if proc.returncode != 0:
             raise CommandException(proc.returncode, out.strip(), err.strip())
         return (out.strip(), err.strip(), proc.pid)
@@ -353,6 +504,7 @@ class SizeAccounting:
         self.volname = volname
         self.conn = None
         self.cursor = None
+        self._transaction_active = False
 
     def __enter__(self):
         """Initialize the Db Connection"""
@@ -370,8 +522,43 @@ class SizeAccounting:
         self.cursor.execute(CREATE_TABLE_1)
         self.cursor.execute(CREATE_TABLE_2)
 
+    def _commit(self):
+        """Commit unless an explicit multi-operation transaction owns it."""
+        if not self._transaction_active:
+            self.conn.commit()
+
+    @contextmanager
+    def immediate_transaction(self):
+        """Hold SQLite's write lock across related reads and mutations."""
+        if self._transaction_active:
+            raise RuntimeError("capacity accounting transaction is already active")
+        self.cursor.execute("BEGIN IMMEDIATE")
+        self._transaction_active = True
+        try:
+            yield self
+        except BaseException:
+            self.conn.rollback()
+            raise
+        else:
+            self.conn.commit()
+        finally:
+            self._transaction_active = False
+
+    @staticmethod
+    def _valid_size(size, *, allow_zero=False):
+        """Return an integer size or reject corrupt/accounting input."""
+        valid = (
+            isinstance(size, int)
+            and not isinstance(size, bool)
+            and (size >= 0 if allow_zero else size > 0)
+        )
+        if not valid:
+            raise ValueError("capacity accounting contains an invalid size")
+        return size
+
     def update_summary(self, size):
         """Update the total available size in storage pool"""
+        size = self._valid_size(size)
 
         # To retain the old value of created_at, select from existing
         query = """
@@ -388,10 +575,11 @@ class SizeAccounting:
         """
 
         self.cursor.execute(query, (self.volname, size, self.volname))
-        self.conn.commit()
+        self._commit()
 
     def update_pv_record(self, pvname, size):
         """Update Each PV size"""
+        size = self._valid_size(size)
 
         # To retain the old value of created_at, select from existing
         query = """
@@ -409,30 +597,58 @@ class SizeAccounting:
         """
         pv_hash = get_volname_hash(pvname)
         self.cursor.execute(query, (pvname, size, pv_hash, pvname))
-        self.conn.commit()
+        self._commit()
 
     def remove_pv_record(self, pvname):
         """Remove PV related entry when PV is deleted"""
 
         self.cursor.execute("DELETE FROM pv_stats WHERE pvname = ?", (pvname, ))
-        self.conn.commit()
+        self._commit()
+
+    def rename_pv_record(self, old_name, new_name, size):
+        """Move a reservation to an archived name without losing capacity."""
+        size = self._valid_size(size)
+        self.cursor.execute(
+            "DELETE FROM pv_stats WHERE pvname IN (?, ?)",
+            (old_name, new_name),
+        )
+        pv_hash = get_volname_hash(new_name)
+        self.cursor.execute(
+            """
+            INSERT INTO pv_stats (
+                pvname, size, hash, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, datetime('now', 'localtime'),
+                datetime('now', 'localtime')
+            )
+            """,
+            (new_name, size, pv_hash),
+        )
+        self._commit()
+
+    def get_pv_size(self, pvname):
+        """Return the absolute size reserved for a PV, or zero if absent."""
+        self.cursor.execute(
+            "SELECT size FROM pv_stats WHERE pvname = ?",
+            (pvname,),
+        )
+        record = self.cursor.fetchone()
+        return self._valid_size(record[0]) if record is not None else 0
 
     def get_stats(self):
         """Get Statistics: total/used/free size, number of pvs"""
-        self.cursor.execute("SELECT COUNT(pvname), SUM(size) FROM pv_stats")
-        number_of_pvs, used_size_bytes = self.cursor.fetchone()
+        self.cursor.execute("SELECT size FROM pv_stats")
+        pv_sizes = [self._valid_size(record[0]) for record in self.cursor]
+        number_of_pvs = len(pv_sizes)
+        used_size_bytes = sum(pv_sizes)
 
         self.cursor.execute("SELECT volname, size FROM summary")
-        _, total_size_bytes = self.cursor.fetchone()
-
-        if total_size_bytes is None:
-            total_size_bytes = 0
-
-        if used_size_bytes is None:
-            used_size_bytes = 0
-
-        if number_of_pvs is None:
-            number_of_pvs = 0
+        summary_record = self.cursor.fetchone()
+        total_size_bytes = (
+            0
+            if summary_record is None
+            else self._valid_size(summary_record[1])
+        )
 
         return {
             "number_of_pvs": number_of_pvs,
@@ -569,10 +785,14 @@ def get_single_pv_per_pool(data):
     """
     kformat = data.get('kadalu_format', None)
     if kformat is not None:
+        if not isinstance(kformat, str):
+            raise ValueError("kadalu_format must be a string")
         return kformat.lower() != "native"
 
     val = data.get("single_pv_per_pool", False)
     if isinstance(val, str):
         return val.lower() == "true"
 
+    if not isinstance(val, bool):
+        raise ValueError("single_pv_per_pool must be a boolean or string")
     return val

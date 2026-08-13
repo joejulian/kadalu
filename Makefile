@@ -102,7 +102,7 @@ pylint:
 	@cp server/kadalu_quotad/quotad.py server/kadalu_quotad/glusterutils.py server/
 	@pylint --disable=W0511,C0209 -s n lib/kadalulib.py
 	@pylint --disable=W0511,W1514,C0209,W0621 -s n server/glusterfsd.py
-	@pylint --disable W0511,W0603,W1514,C0209,W0602 -s n server/quotad.py
+	@pylint --disable=W0511,W0603,W1514,C0209,W0602 -s n server/quotad.py
 	@pylint --disable=W0511 -s n server/server.py
 	@pylint --disable=W0511,W1514,C0209 -s n server/shd.py
 	@pylint --disable=W0603,W1514 -s n server/glusterutils.py

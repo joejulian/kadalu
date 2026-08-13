@@ -3,6 +3,7 @@ KaDalu Operator: Once started, deploys required CSI drivers,
 bootstraps the ConfigMap and waits for the CRD update to create
 Server pods
 """
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,12 @@ DELETE_CMD = "delete"
 PATCH_CMD = "patch"
 
 NODE_PLUGIN = "kadalu-csi-nodeplugin"
+CSI_PROVISIONER = "kadalu-csi-provisioner"
+CSI_DRIVER_NAME = "kadalu"
+SINGLE_PV_CLAIM_VERSION = 1
+CSI_QUIESCE_TIMEOUT_SECONDS = 120
+BLOCK_PV_TYPES = {"virtblock", "rawblock"}
+
 
 def template(filename, **kwargs):
     """Substitute the template with provided fields"""
@@ -159,6 +166,15 @@ def validate_volume_request(obj):
     pv_reclaim_policy = obj["spec"].get("pvReclaimPolicy", "delete")
     if pv_reclaim_policy not in VALID_PV_RECLAIM_POLICY_TYPES:
         logging.error("PV Reclaim Policy not valid")
+        return False
+
+    if (
+            get_single_pv_per_pool(obj["spec"])
+            and pv_reclaim_policy == "archive"):
+        logging.error(
+            "PV Reclaim Policy 'archive' is not supported for "
+            "single_pv_per_pool"
+        )
         return False
 
     voltype = obj["spec"].get("type", None)
@@ -292,13 +308,518 @@ def get_brick_hostname(volname, idx, suffix=True):
     brick_hostname will be "server-spool1-0-0.spool1" and
     server pod name will be "server-spool1-0"
     """
-    tmp_vol = volname.replace("-", "_")
-    dns_friendly_volname = re.sub(r'\W+', '', tmp_vol).replace("_", "-")
+    dns_friendly_volname = _dns_friendly_volname(volname)
     hostname = "server-%s-%d" % (dns_friendly_volname, idx)
     if suffix:
         return "%s-0.%s" % (hostname, volname)
 
     return hostname
+
+
+def _dns_friendly_volname(volname):
+    """Return the volume-name fragment used by server StatefulSets."""
+    tmp_vol = volname.replace("-", "_")
+    return re.sub(r'\W+', '', tmp_vol).replace("_", "-")
+
+
+def is_server_pod_for_volume(pod_name, volname):
+    """Return whether a pod is one of the volume's brick StatefulSet pods."""
+    volume_fragment = re.escape(_dns_friendly_volname(volname))
+    return re.fullmatch(
+        rf"server-{volume_fragment}-\d+-\d+",
+        pod_name,
+    ) is not None
+
+
+def recover_server_volume_id(pods, volname):
+    """Recover one hosting UUID from every existing brick server pod."""
+    matching_pods = [
+        pod for pod in pods
+        if is_server_pod_for_volume(pod.metadata.name, volname)
+    ]
+    if not matching_pods:
+        return None
+
+    recovered = set()
+    for pod in matching_pods:
+        pod_values = set()
+        for container in getattr(pod.spec, "containers", None) or []:
+            for variable in getattr(container, "env", None) or []:
+                if getattr(variable, "name", None) == "VOLUME_ID":
+                    value = getattr(variable, "value", None)
+                    if value:
+                        pod_values.add(value)
+        if len(pod_values) != 1:
+            raise ValueError(
+                f"Server pod {pod.metadata.name} has no unique VOLUME_ID"
+            )
+        recovered.update(pod_values)
+
+    if len(recovered) != 1:
+        raise ValueError("Existing server pods disagree on VOLUME_ID")
+    volume_id = next(iter(recovered))
+    try:
+        if str(uuid.UUID(volume_id)) != volume_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as err:
+        raise ValueError(
+            "Existing server pods contain an invalid VOLUME_ID"
+        ) from err
+    return volume_id
+
+
+def _canonical_gluster_hosts(hosts):
+    """Normalize Gluster endpoints without making their order identity."""
+    if isinstance(hosts, str):
+        hosts = hosts.split(",")
+    if not isinstance(hosts, (list, tuple)):
+        return []
+    return sorted({str(host).strip() for host in hosts if str(host).strip()})
+
+
+def mount_config_fingerprint(data):
+    """Return a stable digest of the backend configuration used by a mount."""
+    canonical = {
+        "schema": 1,
+        "type": data.get("type"),
+        "volname": data.get("volname"),
+        "volume_id": data.get("volume_id"),
+        "single_pv_per_pool": get_single_pv_per_pool(data),
+    }
+    if data.get("type") == VOLUME_TYPE_EXTERNAL:
+        canonical.update({
+            "gluster_hosts": _canonical_gluster_hosts(
+                data.get("gluster_hosts", "")
+            ),
+            "gluster_volname": data.get("gluster_volname"),
+            "gluster_options": data.get("gluster_options", ""),
+        })
+    else:
+        brick_fields = (
+            "brick_device",
+            "brick_index",
+            "brick_path",
+            "decommissioned",
+            "host_brick_path",
+            "kube_hostname",
+            "node",
+            "node_id",
+            "pvc_name",
+        )
+        canonical.update({
+            "bricks": [
+                {
+                    field: brick.get(field)
+                    for field in brick_fields
+                }
+                for brick in data.get("bricks", [])
+            ],
+            "disperse": data.get("disperse", {}),
+            "options": data.get("options", {}),
+            "tiebreaker": data.get("tiebreaker", {}),
+        })
+
+    serialized = json.dumps(
+        canonical,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _external_backend_identity(data):
+    """Return the immutable connection identity for an external pool."""
+    return {
+        "gluster_hosts": _canonical_gluster_hosts(
+            data.get("gluster_hosts", "")
+        ),
+        "gluster_volname": data.get("gluster_volname"),
+        "gluster_options": data.get("gluster_options", ""),
+    }
+
+
+def _decode_pool_record(existing_serialized):
+    """Decode one existing pool record, returning a reason on failure."""
+    try:
+        existing = json.loads(existing_serialized)
+    except (TypeError, ValueError) as err:
+        logging.error(logf(
+            "Existing storage pool metadata is invalid",
+            error=err,
+        ))
+        return None
+    if not isinstance(existing, dict):
+        logging.error("Existing storage pool metadata is not an object")
+        return None
+    return existing
+
+
+def _preserve_single_pv_claim_metadata(
+        data, existing, recovered_legacy_owner=None):
+    """Apply immutable ownership metadata from a decoded pool record."""
+    data.pop("single_pv_claim_version", None)
+    data.pop("legacy_single_pv_volume_id", None)
+    if existing is None:
+        if get_single_pv_per_pool(data):
+            if recovered_legacy_owner is None:
+                data["single_pv_claim_version"] = SINGLE_PV_CLAIM_VERSION
+            else:
+                data["legacy_single_pv_volume_id"] = recovered_legacy_owner
+        return True
+
+    existing_mode = get_single_pv_per_pool(existing)
+    requested_mode = get_single_pv_per_pool(data)
+    if requested_mode != existing_mode:
+        logging.error(logf(
+            "Rejected immutable single_pv_per_pool change",
+            volname=data.get("volname"),
+            existing=existing_mode,
+            requested=requested_mode,
+        ))
+        return False
+    if not existing_mode:
+        return True
+    if (
+            existing.get("single_pv_claim_version")
+            == SINGLE_PV_CLAIM_VERSION):
+        data["single_pv_claim_version"] = SINGLE_PV_CLAIM_VERSION
+        return True
+    legacy_owner = existing.get("legacy_single_pv_volume_id")
+    if legacy_owner:
+        data["legacy_single_pv_volume_id"] = legacy_owner
+    return True
+
+
+def preserve_single_pv_claim_metadata(data, existing_serialized):
+    """Keep ownership generation stable when reconciling an existing pool."""
+    if existing_serialized is None:
+        return _preserve_single_pv_claim_metadata(data, None)
+    existing = _decode_pool_record(existing_serialized)
+    if existing is None:
+        return False
+    return _preserve_single_pv_claim_metadata(data, existing)
+
+
+def _canonical_mount_identity(value):
+    """Return the canonical UUID form of a stored mount identity."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
+def _apply_pool_mount_metadata(
+        data, existing, recovered_legacy_owner=None,
+        legacy_mount_migration=False):
+    """Preserve one pool incarnation and fingerprint its current backend."""
+    legacy_fingerprint = None
+    if existing is not None:
+        legacy_fingerprint = existing.get(
+            "legacy_mount_config_fingerprint"
+        )
+    # This marker is operator-owned. Fresh pools must never inherit one from
+    # request data, while reconciles must preserve an actual migration marker.
+    data.pop("legacy_mount_config_fingerprint", None)
+    if legacy_fingerprint is not None:
+        data["legacy_mount_config_fingerprint"] = legacy_fingerprint
+
+    if not _preserve_single_pv_claim_metadata(
+            data, existing, recovered_legacy_owner):
+        return False
+
+    if existing is not None:
+        for field in ("type", "volname", "volume_id"):
+            existing_value = existing.get(field)
+            if (
+                    existing_value is not None
+                    and data.get(field) != existing_value):
+                logging.error(logf(
+                    "Rejected immutable storage pool identity change",
+                    field=field,
+                    existing=existing_value,
+                    requested=data.get(field),
+                ))
+                return False
+        if (
+                existing.get("type") == VOLUME_TYPE_EXTERNAL
+                and _external_backend_identity(data)
+                != _external_backend_identity(existing)):
+            logging.error(logf(
+                "Rejected immutable external storage backend change",
+                volname=data.get("volname"),
+            ))
+            return False
+
+    mount_identity = None
+    if existing is not None and "mount_identity" in existing:
+        mount_identity = _canonical_mount_identity(
+            existing.get("mount_identity")
+        )
+        if mount_identity is None:
+            logging.error(logf(
+                "Rejected invalid storage pool mount identity",
+                volname=data.get("volname"),
+            ))
+            return False
+    if mount_identity is None:
+        mount_identity = str(uuid.uuid4())
+
+    if legacy_mount_migration:
+        if existing is None or "mount_identity" in existing:
+            logging.error("Legacy mount migration requires an identity-less pool")
+            return False
+        data["legacy_mount_config_fingerprint"] = mount_config_fingerprint(data)
+
+    data["mount_identity"] = mount_identity
+    data["mount_config_fingerprint"] = mount_config_fingerprint(data)
+    return True
+
+
+def apply_pool_mount_metadata(
+        data, existing_serialized, recovered_legacy_owner=None):
+    """Prepare safe ownership and mount identity for a ConfigMap write."""
+    if existing_serialized is None:
+        return _apply_pool_mount_metadata(
+            data,
+            None,
+            recovered_legacy_owner,
+        )
+    existing = _decode_pool_record(existing_serialized)
+    if existing is None:
+        return False
+    return _apply_pool_mount_metadata(data, existing)
+
+
+def discover_single_pv_owners(core_v1_client):
+    """Return existing whole-pool Kadalu PV owners grouped by hosting pool."""
+    claims_by_hostvol = {}
+    persistent_volumes = core_v1_client.list_persistent_volume().items or []
+    for persistent_volume in persistent_volumes:
+        spec = getattr(persistent_volume, "spec", None)
+        csi_source = getattr(spec, "csi", None)
+        if (
+                csi_source is None
+                or getattr(csi_source, "driver", None) != CSI_DRIVER_NAME):
+            continue
+        attributes = getattr(csi_source, "volume_attributes", None) or {}
+        if (
+                not isinstance(attributes, dict)
+                or not get_single_pv_per_pool(attributes)
+                or attributes.get("path")):
+            continue
+        hostvol = attributes.get("hostvol")
+        volume_id = getattr(csi_source, "volume_handle", None)
+        if hostvol and volume_id:
+            claims_by_hostvol.setdefault(hostvol, set()).add(volume_id)
+    return claims_by_hostvol
+
+
+def _pool_persistent_volumes(core_v1_client, volname):
+    """Yield Kadalu PVs provisioned from one hosting pool."""
+    persistent_volumes = core_v1_client.list_persistent_volume().items or []
+    for persistent_volume in persistent_volumes:
+        spec = getattr(persistent_volume, "spec", None)
+        csi_source = getattr(spec, "csi", None)
+        attributes = getattr(csi_source, "volume_attributes", None) or {}
+        if (
+                csi_source is not None
+                and getattr(csi_source, "driver", None) == CSI_DRIVER_NAME
+                and isinstance(attributes, dict)
+                and attributes.get("hostvol") == volname):
+            yield persistent_volume
+
+
+def reconcile_pool_pv_reclaim_policy(
+        core_v1_client, volname, pool_policy, before_config_write):
+    """Patch existing PV policy on the data-safe side of a config write."""
+    reclaim_policy = storage_class_reclaim_policy(pool_policy)
+    if (
+            before_config_write is not None
+            and (reclaim_policy == "Retain") != before_config_write):
+        return
+
+    for persistent_volume in _pool_persistent_volumes(
+            core_v1_client, volname):
+        spec = persistent_volume.spec
+        current_policy = getattr(
+            spec,
+            "persistent_volume_reclaim_policy",
+            None,
+        ) or "Delete"
+        if current_policy == reclaim_policy:
+            continue
+        name = persistent_volume.metadata.name
+        core_v1_client.patch_persistent_volume(
+            name,
+            {"spec": {"persistentVolumeReclaimPolicy": reclaim_policy}},
+        )
+        logging.info(logf(
+            "Updated PersistentVolume reclaim policy",
+            name=name,
+            hostvol=volname,
+            policy=reclaim_policy,
+        ))
+
+
+def recovered_single_pv_owner(core_v1_client, data):
+    """Recover one legacy owner when a pool ConfigMap record is absent."""
+    if not get_single_pv_per_pool(data):
+        return None, True
+
+    owners = discover_single_pv_owners(core_v1_client).get(
+        data.get("volname"),
+        set(),
+    )
+    if len(owners) > 1:
+        logging.error(logf(
+            "Refusing to recreate ambiguous single-PV pool metadata",
+            volname=data.get("volname"),
+            matching_persistent_volumes=len(owners),
+        ))
+        return None, False
+    return (next(iter(owners)) if owners else None), True
+
+
+def apply_pool_mount_metadata_for_write(
+        core_v1_client, data, existing_serialized):
+    """Prepare a ConfigMap write, recovering ownership if its record vanished."""
+    recovered_owner = None
+    if existing_serialized is None:
+        recovered_owner, valid = recovered_single_pv_owner(
+            core_v1_client,
+            data,
+        )
+        if not valid:
+            return False
+    return apply_pool_mount_metadata(
+        data,
+        existing_serialized,
+        recovered_owner,
+    )
+
+
+def _kadalu_block_volume(persistent_volume):
+    """Return the PV and pool identities for a Kadalu block volume."""
+    spec = getattr(persistent_volume, "spec", None)
+    csi_source = getattr(spec, "csi", None)
+    if (
+            csi_source is None
+            or getattr(csi_source, "driver", None) != CSI_DRIVER_NAME):
+        return None
+
+    attributes = getattr(csi_source, "volume_attributes", None) or {}
+    if (
+            not isinstance(attributes, dict)
+            or attributes.get("pvtype") not in BLOCK_PV_TYPES):
+        return None
+    return persistent_volume.metadata.name, attributes.get("hostvol")
+
+
+def _legacy_mount_pools(configmap_records):
+    """Return identity-less hosting pools from validated ConfigMap records."""
+    legacy_pools = set()
+    for key, serialized in (configmap_records or {}).items():
+        if not key.endswith(".info"):
+            continue
+        record = _decode_pool_record(serialized)
+        if record is None:
+            raise ValueError(f"Invalid storage pool metadata in {key}")
+        if "mount_identity" not in record:
+            legacy_pools.add(key[:-len(".info")])
+    return legacy_pools
+
+
+def ensure_kadalu_block_volumes_absent(core_v1_client, reason):
+    """Reject a mount-boundary change while any block PV still exists."""
+    block_volumes = []
+    for persistent_volume in (
+            core_v1_client.list_persistent_volume().items or []):
+        block_volume = _kadalu_block_volume(persistent_volume)
+        if block_volume is not None:
+            block_volumes.append(block_volume)
+
+    if not block_volumes:
+        return
+    details = ", ".join(
+        f"{pv_name} (pool {pool_name or 'unknown'})"
+        for pv_name, pool_name in sorted(set(block_volumes))
+    )
+    raise RuntimeError(
+        f"Cannot {reason} while these Kadalu block PersistentVolumes still "
+        f"exist: {details}. Keep the CSI provisioner quiesced until the block "
+        "volumes can be removed; stopping workloads alone is not sufficient "
+        "because an old block target may lack recovery state."
+    )
+
+
+def legacy_mount_migration_required(configmap_records):
+    """Return whether any hosting pool still lacks a mount identity."""
+    return bool(_legacy_mount_pools(configmap_records))
+
+
+def migrate_legacy_single_pv_claims(core_v1_client):
+    """Prepare legacy ownership and mount identity before CSI starts."""
+    configmap_data = core_v1_client.read_namespaced_config_map(
+        KADALU_CONFIG_MAP, NAMESPACE)
+    if legacy_mount_migration_required(configmap_data.data):
+        ensure_kadalu_block_volumes_absent(
+            core_v1_client,
+            "migrate legacy mount identities",
+        )
+    claims_by_hostvol = discover_single_pv_owners(core_v1_client)
+
+    changed = False
+    for key, serialized in (configmap_data.data or {}).items():
+        if not key.endswith(".info"):
+            continue
+        existing = _decode_pool_record(serialized)
+        if existing is None:
+            raise ValueError(f"Invalid storage pool metadata in {key}")
+        data = dict(existing)
+        if not _apply_pool_mount_metadata(
+                data,
+                existing,
+                legacy_mount_migration="mount_identity" not in existing):
+            raise ValueError(f"Unable to preserve storage pool metadata in {key}")
+
+        if (
+                get_single_pv_per_pool(data)
+                and data.get("single_pv_claim_version")
+                != SINGLE_PV_CLAIM_VERSION):
+            volname = key[:-len(".info")]
+            owners = claims_by_hostvol.get(volname, set())
+            legacy_owner = data.get("legacy_single_pv_volume_id")
+            if legacy_owner:
+                if owners and owners != {legacy_owner}:
+                    logging.warning(logf(
+                        "Preserving legacy single-PV owner despite "
+                        "conflicting PersistentVolumes",
+                        volname=volname,
+                        owner=legacy_owner,
+                        matching_persistent_volumes=len(owners),
+                    ))
+            elif len(owners) == 1:
+                data["legacy_single_pv_volume_id"] = next(iter(owners))
+            else:
+                logging.warning(logf(
+                    "Legacy single-PV pool ownership is ambiguous",
+                    volname=volname,
+                    matching_persistent_volumes=len(owners),
+                ))
+
+        if data != existing:
+            configmap_data.data[key] = json.dumps(data)
+            changed = True
+
+    if changed:
+        core_v1_client.patch_namespaced_config_map(
+            KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
+        logging.info(
+            "Prepared legacy pool ownership and mount identity before CSI rollout"
+        )
 
 
 def upgrade_storage_pods(core_v1_client):
@@ -389,10 +910,11 @@ def update_config_map(core_v1_client, obj):
         },
         "options": {}
     }
-
     # Add new entry in the existing config map
     configmap_data = core_v1_client.read_namespaced_config_map(
         KADALU_CONFIG_MAP, NAMESPACE)
+    volinfo_file = "%s.info" % volname
+    existing_serialized = configmap_data.data.get(volinfo_file)
 
     # Add options entry as key:value
     if obj["spec"].get("options", None):
@@ -428,13 +950,29 @@ def update_config_map(core_v1_client, obj):
 
             data["tiebreaker"] = tiebreaker
 
-    volinfo_file = "%s.info" % volname
+    if not apply_pool_mount_metadata_for_write(
+            core_v1_client, data, existing_serialized):
+        return False
+
+    reconcile_pool_pv_reclaim_policy(
+        core_v1_client,
+        volname,
+        pv_reclaim_policy,
+        before_config_write=True,
+    )
     configmap_data.data[volinfo_file] = json.dumps(data)
 
     core_v1_client.patch_namespaced_config_map(
         KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
+    reconcile_pool_pv_reclaim_policy(
+        core_v1_client,
+        volname,
+        pv_reclaim_policy,
+        before_config_write=False,
+    )
     logging.info(logf("Updated configmap", name=KADALU_CONFIG_MAP,
                       volname=volname))
+    return True
 
 
 def deploy_server_pods(obj):
@@ -496,7 +1034,7 @@ def deploy_server_pods(obj):
     add_tolerations("daemonset", NODE_PLUGIN, tolerations)
 
 
-def handle_external_storage_addition(core_v1_client, obj):
+def handle_external_storage_addition(core_v1_client, obj, storage_api=None):
     """Deploy service(One service per Volume)"""
     volname = obj["metadata"]["name"]
     details = obj["spec"]["details"]
@@ -522,22 +1060,60 @@ def handle_external_storage_addition(core_v1_client, obj):
         "gluster_volname": details["gluster_volname"],
         "gluster_options": details.get("gluster_options", ""),
     }
-
     # Add new entry in the existing config map
     configmap_data = core_v1_client.read_namespaced_config_map(
         KADALU_CONFIG_MAP, NAMESPACE)
     volinfo_file = "%s.info" % volname
+    if not apply_pool_mount_metadata_for_write(
+        core_v1_client,
+        data,
+        configmap_data.data.get(volinfo_file),
+    ):
+        return False
+    reconcile_pool_pv_reclaim_policy(
+        core_v1_client,
+        volname,
+        pv_reclaim_policy,
+        before_config_write=True,
+    )
     configmap_data.data[volinfo_file] = json.dumps(data)
 
     core_v1_client.patch_namespaced_config_map(
         KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
+    reconcile_pool_pv_reclaim_policy(
+        core_v1_client,
+        volname,
+        pv_reclaim_policy,
+        before_config_write=False,
+    )
     logging.info(logf("Updated configmap", name=KADALU_CONFIG_MAP,
                       volname=volname))
     filename = os.path.join(MANIFESTS_DIR, "external-storageclass.yaml")
-    template(filename, **data)
-    lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
+    template(
+        filename,
+        **data,
+        reclaim_policy=storage_class_reclaim_policy(pv_reclaim_policy),
+    )
+    if storage_api is None:
+        storage_api = client.StorageV1Api()
+    reconcile_storage_class_manifest(
+        storage_api,
+        filename,
+        "kadalu." + volname,
+        storage_class_reclaim_policy(pv_reclaim_policy),
+    )
+    # Close the provisioning race around immutable StorageClass replacement.
+    # The directional pass above protects data; this pass catches a PV created
+    # from the old class while reconciliation was in progress.
+    reconcile_pool_pv_reclaim_policy(
+        core_v1_client,
+        volname,
+        pv_reclaim_policy,
+        before_config_write=None,
+    )
     logging.info(logf("Deployed External StorageClass", volname=volname, manifest=filename))
     add_tolerations("daemonset", NODE_PLUGIN, tolerations)
+    return True
 
 
 def handle_added(core_v1_client, obj):
@@ -553,36 +1129,87 @@ def handle_added(core_v1_client, obj):
         ))
         return
 
-    # Ignore if already deployed
     volname = obj["metadata"]["name"]
     pods = core_v1_client.list_namespaced_pod(NAMESPACE)
-    for pod in pods.items:
-        if pod.metadata.name.startswith("server-" + volname + "-"):
-            logging.debug(logf(
-                "Ignoring already deployed server statefulsets",
-                storagename=volname
-            ))
-            return
-
     # Add new entry in the existing config map
     configmap_data = core_v1_client.read_namespaced_config_map(
         KADALU_CONFIG_MAP, NAMESPACE)
+    volinfo_file = "%s.info" % volname
+    existing_serialized = configmap_data.data.get(volinfo_file)
+    existing = None
 
-    if configmap_data.data.get("%s.info" % volname, None):
+    if existing_serialized is not None:
         # Volume already exists
         logging.warning(logf(
             "Updating existing config map",
             storagename=volname
         ))
+        existing = _decode_pool_record(existing_serialized)
+        if existing is None:
+            return
+        requested_mode = get_single_pv_per_pool(obj["spec"])
+        if requested_mode != get_single_pv_per_pool(existing):
+            logging.error(logf(
+                "Rejected immutable single_pv_per_pool change",
+                volname=volname,
+                existing=get_single_pv_per_pool(existing),
+                requested=requested_mode,
+            ))
+            return
 
-    # Generate new Volume ID
-    if obj["spec"].get("volume_id", None) is None:
-        obj["spec"]["volume_id"] = str(uuid.uuid1())
-    # Apply existing Volume ID to recreate storage pool from existing device/path
+    existing_volume_id = existing.get("volume_id") if existing else None
+    requested_volume_id = obj["spec"].get("volume_id")
+    if existing is not None:
+        if not existing_volume_id:
+            logging.error(logf(
+                "Existing storage pool has no volume identity",
+                volname=volname,
+            ))
+            return
+        if (
+                requested_volume_id is not None
+                and requested_volume_id != existing_volume_id):
+            logging.error(logf(
+                "Rejected immutable storage pool volume identity change",
+                volname=volname,
+                existing=existing_volume_id,
+                requested=requested_volume_id,
+            ))
+            return
+        obj["spec"]["volume_id"] = existing_volume_id
+        logging.info(logf(
+            "Reusing existing volume id",
+            volume_id=existing_volume_id,
+        ))
+    elif requested_volume_id is None:
+        try:
+            recovered_volume_id = recover_server_volume_id(pods.items, volname)
+        except ValueError as err:
+            logging.error(logf(
+                "Refusing to reconstruct storage pool identity",
+                volname=volname,
+                error=err,
+            ))
+            return
+        if recovered_volume_id is not None:
+            obj["spec"]["volume_id"] = recovered_volume_id
+            logging.info(logf(
+                "Recovered volume id from existing server pods",
+                volname=volname,
+                volume_id=recovered_volume_id,
+            ))
+        elif any(_pool_persistent_volumes(core_v1_client, volname)):
+            logging.error(logf(
+                "Refusing to reconstruct storage pool without its volume id",
+                volname=volname,
+            ))
+            return
+        else:
+            obj["spec"]["volume_id"] = str(uuid.uuid4())
     else:
         logging.info(logf(
             "Applying existing volume id",
-            volume_id=obj["spec"]["volume_id"]
+            volume_id=requested_volume_id,
         ))
 
     voltype = obj["spec"]["type"]
@@ -594,10 +1221,13 @@ def handle_added(core_v1_client, obj):
     for idx, _ in enumerate(obj["spec"]["storage"]):
         obj["spec"]["storage"][idx]["node_id"] = "node-%d" % idx
 
-    # Storage Class
-    deploy_storage_class(obj)
+    if not update_config_map(core_v1_client, obj):
+        return
+    deploy_storage_class(obj, core_v1_client)
 
-    update_config_map(core_v1_client, obj)
+    # Applying an unchanged StatefulSet is non-disruptive, while always
+    # reconciling it ensures storage placement, devices, tolerations, and other
+    # CR changes made while the operator was down reach existing servers.
     deploy_server_pods(obj)
 
     filename = os.path.join(MANIFESTS_DIR, "services.yaml")
@@ -617,11 +1247,48 @@ def handle_modified(core_v1_client, obj):
 
     voltype = obj["spec"]["type"]
     if voltype == VOLUME_TYPE_EXTERNAL:
-        # Modification of 'External' volume type is not supported
-        logging.info(logf(
-            "Modification of 'External' volume type is not supported",
-            storagename=volname
-        ))
+        if not validate_volume_request(obj):
+            logging.debug(logf(
+                "validation of volume request failed",
+                yaml=obj
+            ))
+            return
+
+        configmap_data = core_v1_client.read_namespaced_config_map(
+            KADALU_CONFIG_MAP, NAMESPACE)
+        existing_serialized = configmap_data.data.get(f"{volname}.info")
+        if existing_serialized is None:
+            logging.warning(logf(
+                "Volume config not found",
+                storagename=volname
+            ))
+            handle_added(core_v1_client, obj)
+            return
+
+        existing = _decode_pool_record(existing_serialized)
+        if existing is None:
+            return
+        existing_volume_id = existing.get("volume_id")
+        if not existing_volume_id:
+            logging.error(logf(
+                "Existing storage pool has no volume identity",
+                volname=volname,
+            ))
+            return
+        requested_volume_id = obj["spec"].get("volume_id")
+        if (
+                requested_volume_id is not None
+                and requested_volume_id != existing_volume_id):
+            logging.error(logf(
+                "Rejected immutable storage pool volume identity change",
+                volname=volname,
+                existing=existing_volume_id,
+                requested=requested_volume_id,
+            ))
+            return
+
+        obj["spec"]["volume_id"] = existing_volume_id
+        handle_external_storage_addition(core_v1_client, obj)
         return
 
     if not validate_volume_request(obj):
@@ -644,7 +1311,9 @@ def handle_modified(core_v1_client, obj):
         return
 
     # Volume ID (uuid) is already generated, re-use
-    cfgmap = json.loads(configmap_data.data[volname + ".info"])
+    cfgmap = _decode_pool_record(configmap_data.data[volname + ".info"])
+    if cfgmap is None:
+        return
     # Get volume-id from config map
     obj["spec"]["volume_id"] = cfgmap["volume_id"]
 
@@ -653,7 +1322,9 @@ def handle_modified(core_v1_client, obj):
         obj["spec"]["storage"][idx]["node_id"] = "node-%d" % idx
 
     # Add new entry in the existing config map
-    update_config_map(core_v1_client, obj)
+    if not update_config_map(core_v1_client, obj):
+        return
+    deploy_storage_class(obj, core_v1_client)
     deploy_server_pods(obj)
 
     filename = os.path.join(MANIFESTS_DIR, "services.yaml")
@@ -927,11 +1598,111 @@ def crd_watch(core_v1_client, k8s_client):
             time.sleep(30)
 
 
-def deploy_csi_pods(core_v1_client):
+def quiesce_csi_provisioner(
+        core_v1_client,
+        apps_v1_client,
+        timeout_seconds=CSI_QUIESCE_TIMEOUT_SECONDS,
+        poll_interval=1):
+    """Stop the old controller before ownership metadata is migrated."""
+    try:
+        apps_v1_client.patch_namespaced_stateful_set(
+            CSI_PROVISIONER,
+            NAMESPACE,
+            {"spec": {"replicas": 0}},
+        )
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        if getattr(err, "status", None) not in (404, "404"):
+            raise
+        logging.info("No existing CSI provisioner StatefulSet to quiesce")
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        pods = core_v1_client.list_namespaced_pod(NAMESPACE)
+        active = [
+            pod.metadata.name
+            for pod in pods.items
+            if pod.metadata.name.startswith(CSI_PROVISIONER + "-")
+        ]
+        if not active:
+            logging.info("CSI provisioner is quiesced")
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for the old CSI provisioner to stop: "
+                + ", ".join(active)
+            )
+        time.sleep(poll_interval)
+
+
+def csi_nodeplugin_rollout_complete(daemon_set):
+    """Return whether every desired node runs the observed DaemonSet revision."""
+    if daemon_set is None:
+        return False
+    metadata = getattr(daemon_set, "metadata", None)
+    status = getattr(daemon_set, "status", None)
+    if status is None:
+        return False
+
+    desired = getattr(status, "desired_number_scheduled", None)
+    updated = getattr(status, "updated_number_scheduled", None)
+    ready = getattr(status, "number_ready", None)
+    if desired is None or updated is None or ready is None:
+        return False
+
+    generation = getattr(metadata, "generation", None)
+    observed = getattr(status, "observed_generation", None)
+    if generation is not None and (
+            observed is None or observed < generation):
+        return False
+    return updated == desired and ready == desired
+
+
+def read_csi_nodeplugin(apps_v1_client):
+    """Read the nodeplugin DaemonSet, treating absence as not rolled out."""
+    try:
+        return apps_v1_client.read_namespaced_daemon_set(
+            NODE_PLUGIN,
+            NAMESPACE,
+        )
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        if getattr(err, "status", None) not in (404, "404"):
+            raise
+        return None
+
+
+def wait_for_csi_nodeplugin_rollout(
+        apps_v1_client,
+        timeout_seconds=CSI_QUIESCE_TIMEOUT_SECONDS,
+        poll_interval=1):
+    """Wait for an explicitly advanced OnDelete nodeplugin rollout."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        daemon_set = read_csi_nodeplugin(apps_v1_client)
+        if csi_nodeplugin_rollout_complete(daemon_set):
+            logging.info("CSI nodeplugin rollout is complete")
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out waiting for the CSI nodeplugin OnDelete rollout. "
+                "The CSI provisioner remains at zero replicas. For each node: "
+                "drain or unpublish its Kadalu volumes, delete that node's old "
+                "kadalu-csi-nodeplugin pod, and wait for its replacement to "
+                "become Ready before continuing with the next node. Restart "
+                "the operator after every desired nodeplugin pod is updated."
+            )
+        time.sleep(poll_interval)
+
+
+def deploy_csi_pods(core_v1_client, provisioner_replicas=1):
     """
     Look for CSI pods, if any one CSI pod found then
     that means it is deployed
     """
+    if provisioner_replicas not in (0, 1):
+        raise ValueError(
+            "CSI provisioner replicas must be zero (upgrade fence) or one"
+        )
+
     pods = core_v1_client.list_namespaced_pod(
         NAMESPACE)
     for pod in pods.items:
@@ -950,10 +1721,34 @@ def deploy_csi_pods(core_v1_client):
              docker_user=docker_user, k8s_dist=K8S_DIST,
              images_hub=IMAGES_HUB,
              csi_sidecar_registry=CSI_SIDECAR_REGISTRY,
-             kubelet_dir=KUBELET_DIR, verbose=VERBOSE,)
+             kubelet_dir=KUBELET_DIR, verbose=VERBOSE,
+             provisioner_replicas=provisioner_replicas)
 
     lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
     logging.info(logf("Deployed CSI Pods", manifest=filename))
+
+
+def deploy_csi_upgrade(core_v1_client, apps_v1_client):
+    """Keep provisioning fenced until metadata and every node are current."""
+    quiesce_csi_provisioner(core_v1_client, apps_v1_client)
+    configmap_data = core_v1_client.read_namespaced_config_map(
+        KADALU_CONFIG_MAP,
+        NAMESPACE,
+    )
+    migration_required = legacy_mount_migration_required(configmap_data.data)
+
+    # Publish the desired OnDelete template without restarting live clients or
+    # allowing the controller to create block volumes during the transition.
+    deploy_csi_pods(core_v1_client, provisioner_replicas=0)
+    if migration_required:
+        ensure_kadalu_block_volumes_absent(
+            core_v1_client,
+            "migrate legacy mount identities",
+        )
+
+    migrate_legacy_single_pv_claims(core_v1_client)
+    wait_for_csi_nodeplugin_rollout(apps_v1_client)
+    deploy_csi_pods(core_v1_client, provisioner_replicas=1)
 
 
 def deploy_config_map(core_v1_client):
@@ -991,12 +1786,56 @@ def deploy_config_map(core_v1_client):
     return uid, upgrade
 
 
-def deploy_storage_class(obj):
+def storage_class_reclaim_policy(pv_reclaim_policy):
+    """Map Kadalu data handling to Kubernetes PV lifecycle semantics."""
+    if pv_reclaim_policy == "retain":
+        return "Retain"
+    return "Delete"
+
+
+def reconcile_storage_class_manifest(
+        storage_api, filename, name, reclaim_policy):
+    """Apply a StorageClass, replacing it when immutable policy changed."""
+    installed = {
+        item.metadata.name: item
+        for item in storage_api.list_storage_class().items
+    }
+    existing = installed.get(name)
+    existing_policy = (
+        getattr(existing, "reclaim_policy", None)
+        if existing is not None
+        else None
+    )
+    # Kubernetes defaults an omitted StorageClass policy to Delete, so legacy
+    # classes which did not render this field do not need replacement.
+    existing_policy = existing_policy or "Delete"
+    if existing is not None and existing_policy != reclaim_policy:
+        logging.info(logf(
+            "Replacing StorageClass to change immutable reclaim policy",
+            name=name,
+            existing=existing_policy,
+            requested=reclaim_policy,
+        ))
+        # Removing a StorageClass does not remove its PVs or PVCs. Waiting for
+        # the exact class to disappear makes the following create deterministic;
+        # if apply fails, a later reconciliation can recreate it from this file.
+        lib_execute(
+            KUBECTL_CMD,
+            DELETE_CMD,
+            "storageclass",
+            name,
+            "--ignore-not-found=true",
+            "--wait=true",
+        )
+    lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
+
+
+def deploy_storage_class(obj, core_v1_client=None, storage_api=None):
     """Deploys the default and custom storage class for KaDalu if not exists"""
 
     # Deploy defalut Storage Class
-    api_instance = client.StorageV1Api()
-    scs = api_instance.list_storage_class()
+    if storage_api is None:
+        storage_api = client.StorageV1Api()
     sc_names = []
     for tmpl in os.listdir(TEMPLATES_DIR):
         if tmpl.startswith("storageclass-") and tmpl.endswith(".j2"):
@@ -1004,17 +1843,30 @@ def deploy_storage_class(obj):
                 tmpl.replace("storageclass-", "").replace(".yaml.j2", "")
             )
 
-    installed_scs = [item.metadata.name for item in scs.items]
     for sc_name in sc_names:
         filename = os.path.join(MANIFESTS_DIR, "storageclass-%s.yaml" % sc_name)
-        if sc_name in installed_scs:
-            logging.info(logf("StorageClass already present, continuing with Apply",
-                              manifest=filename))
+        storage_class_name = "kadalu." + obj["metadata"]["name"]
+        reclaim_policy = storage_class_reclaim_policy(
+            obj["spec"].get("pvReclaimPolicy", "delete")
+        )
 
         template(filename, namespace=NAMESPACE, kadalu_version=VERSION,
                  hostvol_name=obj["metadata"]["name"],
-                 single_pv_per_pool=get_single_pv_per_pool(obj["spec"]))
-        lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
+                 single_pv_per_pool=get_single_pv_per_pool(obj["spec"]),
+                 reclaim_policy=reclaim_policy)
+        reconcile_storage_class_manifest(
+            storage_api,
+            filename,
+            storage_class_name,
+            reclaim_policy,
+        )
+        if core_v1_client is not None:
+            reconcile_pool_pv_reclaim_policy(
+                core_v1_client,
+                obj["metadata"]["name"],
+                obj["spec"].get("pvReclaimPolicy", "delete"),
+                before_config_write=None,
+            )
         logging.info(logf("Deployed StorageClass", manifest=filename))
 
 def add_tolerations(resource, name, tolerations):
@@ -1039,12 +1891,18 @@ def main():
 
     core_v1_client = client.CoreV1Api()
     k8s_client = client.ApiClient()
+    apps_v1_client = client.AppsV1Api(k8s_client)
 
     # ConfigMap
     uid, upgrade = deploy_config_map(core_v1_client)
 
-    # CSI Pods
-    deploy_csi_pods(core_v1_client)
+    if upgrade:
+        # Keep provisioning disabled until legacy metadata is safe and every
+        # explicitly advanced OnDelete nodeplugin is running this release.
+        deploy_csi_upgrade(core_v1_client, apps_v1_client)
+    else:
+        migrate_legacy_single_pv_claims(core_v1_client)
+        deploy_csi_pods(core_v1_client)
 
     if upgrade:
         logging.info(logf("Upgrading to ", version=VERSION))

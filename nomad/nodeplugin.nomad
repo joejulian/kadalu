@@ -19,6 +19,31 @@ variable "kadalu_version" {
   default = "devel"
 }
 
+variable "mount_identity" {
+  default = ""
+
+  description = <<-EOS
+    Stable UUID for this storage-pool incarnation. Leave empty to derive it
+    from volname, or set the same value in both jobs and rotate it whenever a
+    same-named backend is recreated.
+    EOS
+}
+
+locals {
+  volume_id = uuidv5("dns", "${var.volname}.kadalu.io")
+  effective_mount_identity = var.mount_identity != "" ? var.mount_identity : uuidv5("dns", "${var.volname}.mount.kadalu.io")
+  mount_config_fingerprint = sha256(jsonencode({
+    schema             = 1
+    type               = "External"
+    volname            = var.volname
+    volume_id          = local.volume_id
+    single_pv_per_pool = false
+    gluster_hosts      = sort(distinct(compact(split(",", var.gluster_hosts))))
+    gluster_volname    = var.gluster_volname
+    gluster_options    = "log-level=DEBUG"
+  }))
+}
+
 job "kadalu-csi-nodeplugin" {
   datacenters = ["${var.cn_network}"]
 
@@ -38,13 +63,15 @@ job "kadalu-csi-nodeplugin" {
         data = <<-EOS
         {
             "volname": "${var.volname}",
-            "volume_id": "${uuidv5("dns", "${var.volname}.kadalu.io")}",
+            "volume_id": "${local.volume_id}",
             "type": "External",
             "pvReclaimPolicy": "delete",
             "kadalu_format": "native",
             "gluster_hosts": "${var.gluster_hosts}",
             "gluster_volname": "${var.gluster_volname}",
-            "gluster_options": "log-level=DEBUG"
+            "gluster_options": "log-level=DEBUG",
+            "mount_identity": "${local.effective_mount_identity}",
+            "mount_config_fingerprint": "${local.mount_config_fingerprint}"
         }
         EOS
 
@@ -64,6 +91,7 @@ job "kadalu-csi-nodeplugin" {
         CSI_ENDPOINT   = "unix://csi/csi.sock"
         KADALU_VERSION = "${var.kadalu_version}"
         CSI_ROLE       = "nodeplugin"
+        CSI_MOUNT_DIR  = "/csi"
         VERBOSE        = "yes"
         EOS
 

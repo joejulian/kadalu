@@ -28,6 +28,16 @@ variable "kadalu_version" {
   description = "Kadalu CSI version which is tested against Nomad version mentioned in README.md"
 }
 
+variable "mount_identity" {
+  default = ""
+
+  description = <<-EOS
+    Stable UUID for this storage-pool incarnation. Leave empty to derive it
+    from volname, or set the same value in both jobs and rotate it whenever a
+    same-named backend is recreated.
+    EOS
+}
+
 variable "gluster_user" {
   default     = "root"
   description = "Remote user in external gluster cluster who has privileges to run gluster cli"
@@ -47,7 +57,19 @@ variable "ssh_priv_path" {
 }
 
 locals {
-  ssh_priv_key = "${file("${pathexpand("${var.ssh_priv_path}")}")}"
+  ssh_priv_key = file(pathexpand(var.ssh_priv_path))
+  volume_id = uuidv5("dns", "${var.volname}.kadalu.io")
+  effective_mount_identity = var.mount_identity != "" ? var.mount_identity : uuidv5("dns", "${var.volname}.mount.kadalu.io")
+  mount_config_fingerprint = sha256(jsonencode({
+    schema             = 1
+    type               = "External"
+    volname            = var.volname
+    volume_id          = local.volume_id
+    single_pv_per_pool = false
+    gluster_hosts      = sort(distinct(compact(split(",", var.gluster_hosts))))
+    gluster_volname    = var.gluster_volname
+    gluster_options    = "log-level=DEBUG"
+  }))
 }
 
 job "kadalu-csi-controller" {
@@ -55,6 +77,10 @@ job "kadalu-csi-controller" {
   type        = "service"
 
   group "controller" {
+    # The CSI driver serializes same-name creates inside this allocation.
+    # Keep one serving controller, matching the Kubernetes deployment.
+    count = 1
+
     task "kadalu-controller" {
       driver = "docker"
 
@@ -64,13 +90,15 @@ job "kadalu-csi-controller" {
         data = <<-EOS
         {
             "volname": "${var.volname}",
-            "volume_id": "${uuidv5("dns", "${var.volname}.kadalu.io")}",
+            "volume_id": "${local.volume_id}",
             "type": "External",
             "pvReclaimPolicy": "delete",
             "kadalu_format": "native",
             "gluster_hosts": "${var.gluster_hosts}",
             "gluster_volname": "${var.gluster_volname}",
-            "gluster_options": "log-level=DEBUG"
+            "gluster_options": "log-level=DEBUG",
+            "mount_identity": "${local.effective_mount_identity}",
+            "mount_config_fingerprint": "${local.mount_config_fingerprint}"
         }
         EOS
 
