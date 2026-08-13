@@ -198,6 +198,26 @@ def test_nodeplugin_upgrade_requires_explicit_node_by_node_deletion():
     assert nodeplugin["spec"]["updateStrategy"] == {"type": "OnDelete"}
 
 
+def test_nodeplugin_receives_the_same_kubelet_root_it_mounts():
+    nodeplugin = next(
+        document
+        for document in _render_csi_documents()
+        if document["metadata"]["name"] == "kadalu-csi-nodeplugin"
+    )
+    container = next(
+        item
+        for item in nodeplugin["spec"]["template"]["spec"]["containers"]
+        if item["name"] == "kadalu-nodeplugin"
+    )
+    environment = {
+        item["name"]: item["value"]
+        for item in container["env"]
+        if "value" in item
+    }
+
+    assert environment["KUBELET_DIR"] == "/var/lib/kubelet"
+
+
 def test_node_health_check_never_restarts_fuse_owner():
     nodeplugin = next(
         document

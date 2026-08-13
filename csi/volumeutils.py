@@ -868,9 +868,10 @@ def mount_volume(pvpath, mountpoint, pvtype, fstype=None):
     if os.path.ismount(mountpoint):
         return True
 
-    # Create subvol dir if PV is manually created
+    # CSI publish must never invent a missing controller-managed source.
     if not os.path.exists(pvpath):
-        makedirs(pvpath)
+        logging.error(logf("Volume source path does not exist", path=pvpath))
+        return False
 
     # TODO: Will losetup survive container reboot?
     if pvtype == PV_TYPE_RAWBLOCK:

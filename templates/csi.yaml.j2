@@ -104,6 +104,8 @@ spec:
               value: "{{ verbose }}"
             - name: CSI_ROLE
               value: "nodeplugin"
+            - name: KUBELET_DIR
+              value: "{{ kubelet_dir }}"
           volumeMounts:
             - name: plugin-dir
               mountPath: /plugin
