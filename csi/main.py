@@ -3,6 +3,7 @@ Starting point of CSI driver GRP server
 """
 import logging
 import os
+import signal
 import time
 from concurrent import futures
 
@@ -16,6 +17,12 @@ from volumeutils import (HOSTVOL_MOUNTDIR, get_pv_hosting_volumes,
                          mount_glusterfs)
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
+
+
+def _handle_sighup(_signum, _frame):
+    """Ignore legacy reload signals; volfile servers push configuration."""
+    logging.info("Received SIGHUP; volfile servers push configuration updates")
+
 
 def mount_storage():
     """
@@ -47,6 +54,7 @@ def main():
     the GRPC server in required endpoint
     """
     logging_setup()
+    signal.signal(signal.SIGHUP, _handle_sighup)
 
     # If Provisioner pod reboots, mount volumes if they exist before reboot
     mount_storage()

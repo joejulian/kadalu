@@ -950,16 +950,14 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
     for brick in data["bricks"]:
         hosts.append(brick["node"])
 
-    try:
-        if not is_server_pod_reachable(hosts, 24007, 20):
-            err = "Cannot establish socket connection with none of the hosts!"
-            cmd = "sock.connect(hosts, 24007)"
-            raise CommandException(-1, cmd, err)
-    except CommandException:
+    if not is_server_pod_reachable(hosts, 24007, 20):
         logging.error(logf(
             "None of the server pods are reachable",
             volume=volume
         ))
+        err = "Cannot establish a socket connection with any server pod"
+        cmd = "sock.connect(hosts, 24007)"
+        raise CommandException(-1, cmd, err)
 
     # Ignore if already glusterfs process running for that volume
     if is_gluster_mount_proc_running(volname, mountpoint):
@@ -969,18 +967,19 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
         ))
         return mountpoint
 
-    # Ignore if already mounted
-    if is_gluster_mount_proc_running(volname, mountpoint):
-        logging.debug(logf(
-            "Already mounted (2nd try)",
-            mount=mountpoint
-        ))
-        return mountpoint
-
     if not os.path.exists(mountpoint):
         makedirs(mountpoint)
 
     with mount_lock:
+        # Another request may have mounted this volume while this request was
+        # waiting for the lock.
+        if is_gluster_mount_proc_running(volname, mountpoint):
+            logging.debug(logf(
+                "Already mounted after waiting for mount lock",
+                mount=mountpoint
+            ))
+            return mountpoint
+
         # Fix the log, so we can check it out later
         # log_file = "/var/log/gluster/%s.log" % mountpoint.replace("/", "-")
         log_file = "/var/log/gluster/gluster.log"
@@ -1007,13 +1006,16 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
         try:
             (_, err, _) = execute(*cmd)
         except CommandException as err:
+            if _mount_succeeded_after_command_error(
+                    err, volname, mountpoint):
+                return mountpoint
             logging.error(logf(
                 "error to execute command",
                 volume=volume,
                 cmd=cmd,
                 error=format(err)
             ))
-            raise err
+            raise
 
     return mountpoint
 
@@ -1027,19 +1029,25 @@ def handle_external_volume(volume, mountpoint, is_client, hosts):
 
     # Try to mount the Host Volume, handle failure if
     # already mounted
-    if not is_gluster_mount_proc_running(volname, mountpoint):
-        with mount_lock:
-            mount_glusterfs_with_host(volname,
-                                    mountpoint,
-                                    hosts,
-                                    volume['g_options'],
-                                    is_client)
-    else:
+    if is_gluster_mount_proc_running(volname, mountpoint):
         logging.debug(logf(
             "Already mounted",
             mount=mountpoint
         ))
         return mountpoint
+
+    with mount_lock:
+        if is_gluster_mount_proc_running(volname, mountpoint):
+            logging.debug(logf(
+                "Already mounted after waiting for mount lock",
+                mount=mountpoint
+            ))
+            return mountpoint
+        mount_glusterfs_with_host(volname,
+                                  mountpoint,
+                                  hosts,
+                                  volume['g_options'],
+                                  is_client)
 
     use_gluster_quota = False
     if (os.path.isfile("/etc/secret-volume/ssh-privatekey")
@@ -1082,6 +1090,33 @@ def handle_external_volume(volume, mountpoint, is_client, hosts):
     return mountpoint
 
 
+def _mount_succeeded_after_command_error(error, volname, mountpoint):
+    """Return true only when exit 32 left the exact mount client running."""
+    if error.ret != 32:
+        return False
+
+    if not is_gluster_mount_proc_running(volname, mountpoint):
+        return False
+
+    logging.info(logf(
+        "Gluster mount process started despite command exit status",
+        volume=volname,
+        mount=mountpoint,
+        status=error.ret,
+    ))
+    return True
+
+
+def _execute_glusterfs_mount(command, volname, mountpoint):
+    """Execute a Gluster mount, accepting only a verified exit-32 race."""
+    try:
+        execute(*command)
+    except CommandException as error:
+        if not _mount_succeeded_after_command_error(
+                error, volname, mountpoint):
+            raise
+
+
 # noqa # pylint: disable=unused-argument
 def mount_glusterfs_with_host(volname, mountpoint, hosts, options=None, is_client=False):
     """Mount Glusterfs Volume"""
@@ -1118,29 +1153,33 @@ def mount_glusterfs_with_host(volname, mountpoint, hosts, options=None, is_clien
 
     command = cmd + g_ops + [mountpoint]
     try:
-        execute(*command)
+        _execute_glusterfs_mount(command, volname, mountpoint)
     except CommandException as excep:
-        if  excep.err.find("invalid option") != -1 or excep.err.find("unrecognized option") != -1:
+        if ("invalid option" in excep.err
+                or "unrecognized option" in excep.err):
             logging.warning(logf(
                 "proceeding without supplied incorrect mount options",
                 options=g_ops,
                 ))
             command = cmd + [mountpoint]
             try:
-                execute(*command)
+                _execute_glusterfs_mount(command, volname, mountpoint)
             except CommandException as retry_err:
                 logging.error(logf(
                     "mount command failed",
                     cmd=command,
                     error=retry_err,
                 ))
-                raise retry_err
+                raise
+            return mountpoint
         logging.error(logf(
             "mount command failed",
             cmd=command,
             error=excep,
         ))
-        raise excep
+        raise
+
+    return mountpoint
 
 
 def check_external_volume(pv_request, host_volumes):

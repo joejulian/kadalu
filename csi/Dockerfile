@@ -18,7 +18,6 @@ RUN apt-get update -yq && \
     apt-get install -y --no-install-recommends \
         attr \
         bash \
-        inotify-tools \
         libacl1 \
         libgoogle-perftools4 \
         libssl3 \
@@ -63,7 +62,6 @@ COPY csi/nodeserver.py         /kadalu/
 COPY csi/volumeutils.py        /kadalu/
 COPY lib/startup.sh            /kadalu/
 COPY csi/quota-crawler.sh      /kadalu/
-COPY csi/watch-vol-changes.sh  /kadalu/
 COPY csi/client_heal.sh        /kadalu/
 COPY csi/remove_archived_pv.py /kadalu/
 COPY csi/watch-logrotate.sh    /kadalu/
