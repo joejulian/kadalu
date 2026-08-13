@@ -16,6 +16,61 @@ HOSTVOL_MOUNTDIR = "/mnt"
 MOUNTS_FILE = "/proc/mounts"
 
 
+def _is_within(path, parent):
+    """Return whether an absolute path is contained by an absolute parent."""
+    try:
+        return os.path.commonpath((path, parent)) == parent
+    except ValueError:
+        return False
+
+
+def _validate_volume_paths(hostvol, pvpath):
+    """Build mount paths after rejecting unsafe CSI volume context values."""
+    separators = (os.sep,) if os.altsep is None else (os.sep, os.altsep)
+    if (not hostvol
+            or "\0" in hostvol
+            or hostvol in (os.curdir, os.pardir)
+            or os.path.isabs(hostvol)
+            or any(separator in hostvol for separator in separators)):
+        raise ValueError("hostvol must be a non-empty path component")
+
+    if "\0" in pvpath or os.path.isabs(pvpath):
+        raise ValueError("path must be relative to its hosting volume")
+
+    if pvpath == os.curdir or os.pardir in pvpath.split(os.sep):
+        raise ValueError("path must not contain parent-directory references")
+
+    mount_root = os.path.abspath(HOSTVOL_MOUNTDIR)
+    real_mount_root = os.path.realpath(mount_root)
+    mntdir = os.path.join(mount_root, hostvol)
+    real_mntdir = os.path.realpath(mntdir)
+    expected_real_mntdir = os.path.join(real_mount_root, hostvol)
+    if real_mntdir != expected_real_mntdir:
+        raise ValueError("hostvol must not resolve through a symbolic link")
+
+    pvpath_full = os.path.normpath(os.path.join(mntdir, pvpath))
+    if not _is_within(pvpath_full, mntdir):
+        raise ValueError("path escapes its hosting volume")
+
+    return mntdir, pvpath_full
+
+
+def _validate_resolved_volume_path(mntdir, pvpath_full):
+    """Reject links exposed by a hosting volume after it has been mounted."""
+    real_mntdir = os.path.realpath(mntdir)
+    real_mount_root = os.path.realpath(os.path.dirname(mntdir))
+    expected_real_mntdir = os.path.join(
+        real_mount_root,
+        os.path.basename(mntdir),
+    )
+    if real_mntdir != expected_real_mntdir:
+        raise ValueError("hostvol must not resolve through a symbolic link")
+
+    real_pvpath = os.path.realpath(pvpath_full)
+    if not _is_within(real_pvpath, real_mntdir):
+        raise ValueError("path resolves outside its hosting volume")
+
+
 def _unescape_mount_field(value):
     """Decode the octal escapes used in /proc/mounts fields."""
     return re.sub(
@@ -56,6 +111,8 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
     volume mount and PV mounts.
     Ref:https://github.com/container-storage-interface/spec/blob/master/spec.md
     """
+    # Each invalid CSI field is reported through the gRPC context immediately.
+    # pylint: disable=too-many-return-statements
     def NodePublishVolume(self, request, context):
         start_time = time.time()
         if not request.volume_id:
@@ -94,9 +151,14 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
         gvolname = request.volume_context.get("gvolname", None)
         options = request.volume_context.get("options", None)
 
-        mntdir = os.path.join(HOSTVOL_MOUNTDIR, hostvol)
-
-        pvpath_full = os.path.join(mntdir, pvpath)
+        try:
+            mntdir, pvpath_full = _validate_volume_paths(hostvol, pvpath)
+        except ValueError as err:
+            errmsg = f"Invalid volume context: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return csi_pb2.NodePublishVolumeResponse()
 
         logging.debug(logf(
             "Received a valid mount request",
@@ -117,6 +179,15 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
         }
 
         mount_glusterfs(volume, mntdir, True)
+
+        try:
+            _validate_resolved_volume_path(mntdir, pvpath_full)
+        except ValueError as err:
+            errmsg = f"Invalid volume context: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return csi_pb2.NodePublishVolumeResponse()
 
         if voltype == "External":
             logging.debug(logf(

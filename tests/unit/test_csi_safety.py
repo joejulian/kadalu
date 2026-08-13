@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import grpc
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +48,18 @@ def _existing_volume(
 
 def _fail_if_called(*_args, **_kwargs):
     raise AssertionError("a non-expanding request must not mutate the vault")
+
+
+def _node_publish_request(csi_pb2, volume_context):
+    return csi_pb2.NodePublishVolumeRequest(
+        volume_id="pvc-bellagio-vault",
+        target_path="/target/bellagio-vault",
+        volume_capability={
+            "mount": {},
+            "access_mode": {"mode": "MULTI_NODE_MULTI_WRITER"},
+        },
+        volume_context=volume_context,
+    )
 
 
 def test_expand_retry_never_shrinks_an_existing_volume(monkeypatch):
@@ -314,6 +327,283 @@ def test_failed_external_quota_expansion_does_not_commit_metadata(monkeypatch):
 
     assert response.capacity_bytes == existing.size
     assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("hostvol", [
+    "",
+    ".",
+    "..",
+    "../bellagio-pool",
+    "bellagio/pool",
+    "/bellagio-pool",
+    "bellagio\0pool",
+])
+def test_node_publish_rejects_unsafe_hostvol_before_mount(
+        monkeypatch, hostvol):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    monkeypatch.setattr(nodeserver, "mount_glusterfs", _fail_if_called)
+    monkeypatch.setattr(nodeserver, "mount_volume", _fail_if_called)
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": hostvol,
+            "pvtype": "subvol",
+            "path": "subvol/ab/cd/pvc-bellagio-vault",
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("pvpath", [
+    "/outside/bellagio-vault",
+    "../outside/bellagio-vault",
+    "subvol/../../outside/bellagio-vault",
+    "subvol/../bellagio-vault",
+    "subvol/ab/\0/pvc-bellagio-vault",
+])
+def test_node_publish_rejects_unsafe_pvpath_before_mount(
+        monkeypatch, tmp_path, pvpath):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    mount_root.mkdir()
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(nodeserver, "mount_glusterfs", _fail_if_called)
+    monkeypatch.setattr(nodeserver, "mount_volume", _fail_if_called)
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": "bellagio-pool",
+            "pvtype": "subvol",
+            "path": pvpath,
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_node_publish_rejects_pvpath_symlink_escape_before_bind_mount(
+        monkeypatch, tmp_path):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    hostvol_root = mount_root / "bellagio-pool"
+    outside_root = tmp_path / "outside"
+    hostvol_root.mkdir(parents=True)
+    outside_root.mkdir()
+    (hostvol_root / "subvol").symlink_to(outside_root, target_is_directory=True)
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    host_mounts = []
+    monkeypatch.setattr(
+        nodeserver,
+        "mount_glusterfs",
+        lambda *args: host_mounts.append(args),
+    )
+    monkeypatch.setattr(nodeserver, "mount_volume", _fail_if_called)
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": "bellagio-pool",
+            "pvtype": "subvol",
+            "path": "subvol/pvc-bellagio-vault",
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert len(host_mounts) == 1
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_node_publish_rechecks_links_exposed_by_host_mount(
+        monkeypatch, tmp_path):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    hostvol_root = mount_root / "bellagio-pool"
+    outside_root = tmp_path / "outside"
+    hostvol_root.mkdir(parents=True)
+    outside_root.mkdir()
+
+    def expose_remote_symlink(*_args):
+        (hostvol_root / "subvol").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(nodeserver, "mount_glusterfs", expose_remote_symlink)
+    monkeypatch.setattr(nodeserver, "mount_volume", _fail_if_called)
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": "bellagio-pool",
+            "pvtype": "subvol",
+            "path": "subvol/pvc-bellagio-vault",
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_node_publish_rechecks_hostvol_link_after_mount(monkeypatch, tmp_path):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    hostvol_root = mount_root / "bellagio-pool"
+    outside_root = tmp_path / "outside"
+    hostvol_root.mkdir(parents=True)
+    outside_root.mkdir()
+
+    def replace_mountpoint_with_symlink(*_args):
+        hostvol_root.rmdir()
+        hostvol_root.symlink_to(outside_root, target_is_directory=True)
+
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(
+        nodeserver,
+        "mount_glusterfs",
+        replace_mountpoint_with_symlink,
+    )
+    monkeypatch.setattr(nodeserver, "mount_volume", _fail_if_called)
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": "bellagio-pool",
+            "pvtype": "subvol",
+            "path": "subvol/ab/cd/pvc-bellagio-vault",
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_node_publish_rejects_hostvol_symlink_before_mount(
+        monkeypatch, tmp_path):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    outside_root = tmp_path / "outside"
+    mount_root.mkdir()
+    outside_root.mkdir()
+    (mount_root / "bellagio-pool").symlink_to(
+        outside_root,
+        target_is_directory=True,
+    )
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(nodeserver, "mount_glusterfs", _fail_if_called)
+    monkeypatch.setattr(nodeserver, "mount_volume", _fail_if_called)
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": "bellagio-pool",
+            "pvtype": "subvol",
+            "path": "",
+            "single_pv_per_pool": "True",
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_node_publish_accepts_generated_path_and_legacy_hostvol_name(
+        monkeypatch, tmp_path):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    mount_root.mkdir()
+    mounted = []
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(
+        nodeserver,
+        "mount_glusterfs",
+        lambda volume, mountpoint, is_client: mounted.append(
+            (volume, mountpoint, is_client)
+        ),
+    )
+    monkeypatch.setattr(
+        nodeserver,
+        "mount_volume",
+        lambda *args, **kwargs: mounted.append((args, kwargs)) or True,
+    )
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": "Replica1",
+            "hostvol": "Legacy_Bellagio.Pool",
+            "pvtype": "subvol",
+            "path": "subvol/ab/cd/pvc-bellagio-vault",
+        }),
+        context,
+    )
+
+    expected_root = mount_root / "Legacy_Bellagio.Pool"
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert mounted[0][1:] == (str(expected_root), True)
+    assert mounted[1] == ((
+        str(expected_root / "subvol/ab/cd/pvc-bellagio-vault"),
+        "/target/bellagio-vault",
+        "subvol",
+    ), {"fstype": None})
+    assert context.code is None
+
+
+@pytest.mark.parametrize("voltype", ["External", "Replica1"])
+def test_node_publish_accepts_empty_path_for_single_pv_pool(
+        monkeypatch, tmp_path, voltype):
+    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    mount_root = tmp_path / "mnt"
+    mount_root.mkdir()
+    pv_mounts = []
+    monkeypatch.setattr(nodeserver, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(nodeserver, "mount_glusterfs", lambda *_args: None)
+    monkeypatch.setattr(
+        nodeserver,
+        "mount_volume",
+        lambda *args, **_kwargs: pv_mounts.append(args) or True,
+    )
+
+    context = FakeContext()
+    response = nodeserver.NodeServer().NodePublishVolume(
+        _node_publish_request(csi_pb2, {
+            "type": voltype,
+            "hostvol": "bellagio-pool",
+            "pvtype": "subvol",
+            "path": "",
+            "single_pv_per_pool": "True",
+        }),
+        context,
+    )
+
+    assert isinstance(response, csi_pb2.NodePublishVolumeResponse)
+    assert pv_mounts[0][0] == str(mount_root / "bellagio-pool")
+    assert context.code is None
 
 
 def test_node_unpublish_never_executes_volume_handle_as_shell(monkeypatch):
