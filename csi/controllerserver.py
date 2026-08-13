@@ -218,6 +218,18 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
         volume = search_volume(request.name)
         if volume:
             if existing_volume_is_compatible(volume, request, pvtype):
+                # A prior request can create the PV metadata and then fail
+                # while updating stat.db. Reconcile the absolute-size record
+                # on retries; update_pv_record uses INSERT OR REPLACE, so this
+                # repairs interrupted creates without adding the size twice.
+                if (
+                        volume.extra['hostvoltype'] == "External"
+                        and not volume.single_pv_per_pool):
+                    update_free_size(
+                        volume.hostvol,
+                        volume.volname,
+                        -volume.size,
+                    )
                 return existing_volume_response(volume)
 
             errmsg = "A volume with this name already exists incompatibly"
@@ -369,6 +381,12 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                             return csi_pb2.CreateVolumeResponse()
                         save_pv_metadata(mntdir, vol.volpath, pvsize)
+
+                # SizeAccounting stores one absolute record per PV. Compatible
+                # retries reconcile this record above if this write is
+                # interrupted after the PV metadata has been persisted.
+                update_free_size(ext_volume['name'], request.name, -pvsize)
+
                 logging.info(logf(
                     "Volume created",
                     name=request.name,

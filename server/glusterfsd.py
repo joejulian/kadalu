@@ -19,6 +19,7 @@ VOLUME_ID_XATTR_NAME = "trusted.glusterfs.volume-id"
 VOLFILES_DIR = "/var/lib/kadalu/volfiles"
 VOLINFO_DIR = "/var/lib/gluster"
 MKFS_XFS_CMD = "/sbin/mkfs.xfs"
+XFS_GROWFS_CMD = "/sbin/xfs_growfs"
 
 
 def create_brickdir(brick_path):
@@ -189,6 +190,31 @@ def create_and_mount_brick(brick_device, brick_path, brickfs):
 
         else:
             pass
+
+    # xfs_growfs is idempotent when the filesystem already uses all of the
+    # backing device. Run it after every successful (or already active) mount
+    # so an expanded device becomes usable when the brick pod starts again.
+    if brickfs.lower() == "xfs":
+        try:
+            execute(XFS_GROWFS_CMD, "-d", mountdir)
+            logging.info(logf(
+                "Successfully grew brick filesystem",
+                fstype=brickfs,
+                device=brick_device,
+                mountdir=mountdir,
+            ))
+        except CommandException as err:
+            # Do not start the brick while an expected filesystem expansion
+            # is incomplete. Exiting lets the pod retry and makes a permanent
+            # growth failure visible instead of silently serving less space.
+            logging.error(logf(
+                "Failed to grow brick filesystem",
+                fstype=brickfs,
+                device=brick_device,
+                mountdir=mountdir,
+                error=err,
+            ))
+            sys.exit(1)
 
 
 def start_args():
