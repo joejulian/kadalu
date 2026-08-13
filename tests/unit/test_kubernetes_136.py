@@ -33,20 +33,23 @@ SIDECAR_IMAGES = {
 }
 
 
-def _render_csi_documents():
+def _render_csi_documents(provisioner_replicas=None):
     template = Template(
         (ROOT / "templates/csi.yaml.j2").read_text(encoding="utf-8")
     )
-    rendered = template.render(
-        namespace="the-vault",
-        images_hub="registry.example.invalid",
-        docker_user="ocean-crew",
-        kadalu_version="test",
-        k8s_dist="kubernetes",
-        kubelet_dir="/var/lib/kubelet",
-        verbose="no",
-        csi_sidecar_registry="registry.k8s.io",
-    )
+    values = {
+        "namespace": "the-vault",
+        "images_hub": "registry.example.invalid",
+        "docker_user": "ocean-crew",
+        "kadalu_version": "test",
+        "k8s_dist": "kubernetes",
+        "kubelet_dir": "/var/lib/kubelet",
+        "verbose": "no",
+        "csi_sidecar_registry": "registry.k8s.io",
+    }
+    if provisioner_replicas is not None:
+        values["provisioner_replicas"] = provisioner_replicas
+    rendered = template.render(**values)
     return [document for document in yaml.safe_load_all(rendered) if document]
 
 
@@ -71,6 +74,23 @@ def _helm_documents():
     except FileNotFoundError:
         pytest.skip("helm is unavailable")
     return [document for document in yaml.safe_load_all(rendered) if document]
+
+
+def test_operator_can_patch_persistent_volume_reclaim_policy():
+    operator_role = next(
+        document
+        for document in _helm_documents()
+        if document.get("kind") == "ClusterRole"
+        and document.get("metadata", {}).get("name") == "kadalu-operator"
+    )
+    persistent_volume_rule = next(
+        rule
+        for rule in operator_role["rules"]
+        if rule.get("apiGroups") == [""]
+        and "persistentvolumes" in rule.get("resources", [])
+    )
+
+    assert "patch" in persistent_volume_rule["verbs"]
 
 
 def test_fork_images_default_to_ghcr_namespace():
@@ -147,6 +167,14 @@ def test_kubernetes_development_tools_use_fork_image_defaults():
             'image = "ghcr.io/joejulian/kadalu-csi:'
             '${var.kadalu_version}"' in nomad_job
         )
+        assert 'variable "mount_identity"' in nomad_job
+        assert 'mount_config_fingerprint = sha256(jsonencode({' in nomad_job
+        assert '"mount_identity": "${local.effective_mount_identity}"' \
+            in nomad_job
+        assert (
+            '"mount_config_fingerprint": '
+            '"${local.mount_config_fingerprint}"'
+        ) in nomad_job
 
 
 def test_current_multi_arch_csi_sidecars_are_digest_pinned():
@@ -188,6 +216,20 @@ def test_controller_sidecars_have_leader_election_health_checks():
         )
 
 
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(None, 1), (0, 0), (1, 1), (2, 1)],
+)
+def test_controller_replica_fence_is_renderable(requested, expected):
+    provisioner = next(
+        document
+        for document in _render_csi_documents(requested)
+        if document["metadata"]["name"] == "kadalu-csi-provisioner"
+    )
+
+    assert provisioner["spec"]["replicas"] == expected
+
+
 def test_nodeplugin_upgrade_requires_explicit_node_by_node_deletion():
     nodeplugin = next(
         document
@@ -196,6 +238,22 @@ def test_nodeplugin_upgrade_requires_explicit_node_by_node_deletion():
     )
 
     assert nodeplugin["spec"]["updateStrategy"] == {"type": "OnDelete"}
+
+
+def test_nodeplugin_startup_does_not_rewrite_existing_pvc_mounts():
+    """A restart must leave kubelet's existing per-PVC mounts untouched."""
+    nodeplugin = next(
+        document
+        for document in _render_csi_documents()
+        if document["metadata"]["name"] == "kadalu-csi-nodeplugin"
+    )
+    container = next(
+        item
+        for item in nodeplugin["spec"]["template"]["spec"]["containers"]
+        if item["name"] == "kadalu-nodeplugin"
+    )
+
+    assert "lifecycle" not in container
 
 
 def test_nodeplugin_receives_the_same_kubelet_root_it_mounts():
@@ -216,6 +274,43 @@ def test_nodeplugin_receives_the_same_kubelet_root_it_mounts():
     }
 
     assert environment["KUBELET_DIR"] == "/var/lib/kubelet"
+
+
+@pytest.mark.parametrize(
+    ("template_name", "values"),
+    [
+        (
+            "storageclass-kadalu.custom.yaml.j2",
+            {
+                "hostvol_name": "bellagio-vault",
+                "single_pv_per_pool": False,
+            },
+        ),
+        (
+            "external-storageclass.yaml.j2",
+            {
+                "volname": "mirage-vault",
+                "gluster_hosts": "gluster.example.invalid",
+                "gluster_volname": "mirage",
+                "gluster_options": "",
+                "single_pv_per_pool": False,
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("reclaim_policy", ["Delete", "Retain"])
+def test_storage_class_templates_render_explicit_reclaim_policy(
+        template_name, values, reclaim_policy):
+    template = Template(
+        (ROOT / "templates" / template_name).read_text(encoding="utf-8")
+    )
+
+    storage_class = yaml.safe_load(template.render(
+        **values,
+        reclaim_policy=reclaim_policy,
+    ))
+
+    assert storage_class["reclaimPolicy"] == reclaim_policy
 
 
 def test_node_health_check_never_restarts_fuse_owner():

@@ -1,10 +1,12 @@
 """Regression tests for CSI process and Gluster mount lifecycle handling."""
 
+import errno
 import importlib
 import json
 import signal
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +54,79 @@ def _external_volume():
         "g_host": "server-bellagio-vault-0",
         "g_options": "log-level=WARNING",
     }
+
+
+def test_mount_identity_rejects_tampered_backend_fingerprint(
+        monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    volume = {
+        **_external_volume(),
+        "volname": "bellagio-pool",
+        "volume_id": "pvc-danny-ocean",
+        "kadalu_format": "native",
+        "gluster_hosts": "server-bellagio-vault-0",
+        "gluster_volname": "bellagio-vault",
+        "gluster_options": "log-level=WARNING",
+        "mount_identity": "12345678-1234-5678-9234-567812345678",
+        "mount_config_fingerprint": "0" * 64,
+    }
+
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        volumeutils.mount_identity_token(volume)
+
+
+def test_mount_identity_binds_generation_to_backend_fingerprint(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    volume = {
+        **_external_volume(),
+        "volname": "bellagio-pool",
+        "volume_id": "pvc-danny-ocean",
+        "kadalu_format": "native",
+        "gluster_hosts": "server-bellagio-vault-0",
+        "gluster_volname": "bellagio-vault",
+        "gluster_options": "log-level=WARNING",
+        "mount_identity": "12345678-1234-5678-9234-567812345678",
+    }
+    fingerprint = volumeutils.mount_config_fingerprint(volume)
+    volume["mount_config_fingerprint"] = fingerprint
+
+    assert volumeutils.mount_identity_token(volume) == (
+        f"{volume['mount_identity']}-{fingerprint}"
+    )
+
+
+def test_legacy_mount_fallback_requires_unchanged_migration_fingerprint(
+        monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    volume = {
+        **_external_volume(),
+        "volname": "bellagio-pool",
+        "volume_id": "pvc-danny-ocean",
+        "gluster_hosts": "server-bellagio-vault-0",
+        "gluster_volname": "bellagio-vault",
+        "gluster_options": "log-level=WARNING",
+        "mount_identity": "12345678-1234-5678-9234-567812345678",
+    }
+    volume["legacy_mount_config_fingerprint"] = (
+        volumeutils.mount_config_fingerprint(volume)
+    )
+
+    assert volumeutils.legacy_mount_fallback_authorized(volume)
+
+    volume["gluster_hosts"] = "server-the-mirage-decoy-0"
+    assert not volumeutils.legacy_mount_fallback_authorized(volume)
+
+
+def test_fresh_pool_has_no_legacy_mount_fallback(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+
+    assert not volumeutils.legacy_mount_fallback_authorized({
+        **_external_volume(),
+        "volname": "bellagio-pool",
+        "volume_id": "pvc-danny-ocean",
+        "gluster_hosts": "server-bellagio-vault-0",
+        "gluster_volname": "bellagio-vault",
+    })
 
 
 def test_main_registers_sighup_handler_before_mounting_storage(monkeypatch):
@@ -113,6 +188,43 @@ def test_main_registers_sighup_handler_before_mounting_storage(monkeypatch):
     signal_event[1](signal.SIGHUP, None)
 
 
+@pytest.mark.parametrize("error_type", ["conflict", "oserror", "value"])
+def test_startup_mount_failure_does_not_exit_entire_csi_server(
+        monkeypatch, error_type):
+    main = _load_csi_module(monkeypatch, "main")
+    monkeypatch.setenv("CSI_ROLE", "provisioner")
+    volumes = [
+        {
+            "name": "benedict-decoy",
+            "single_pv_per_pool": False,
+        },
+        {
+            "name": "bellagio-vault",
+            "single_pv_per_pool": False,
+        },
+    ]
+    monkeypatch.setattr(main, "get_pv_hosting_volumes", lambda _filters: volumes)
+    mounted = []
+    errors = {
+        "conflict": main.MountTargetConflictError(
+            "Benedict occupied the fake vault mount"
+        ),
+        "oserror": OSError(errno.ESTALE, "the decoy mount is stale"),
+        "value": ValueError("the fake mount identity is invalid"),
+    }
+
+    def mount(volume, _mountpoint):
+        if volume["name"] == "benedict-decoy":
+            raise errors[error_type]
+        mounted.append(volume["name"])
+
+    monkeypatch.setattr(main, "mount_glusterfs", mount)
+
+    main.mount_storage()
+
+    assert mounted == ["bellagio-vault"]
+
+
 def test_obsolete_configmap_watcher_is_not_packaged_or_started():
     start = (ROOT / "csi" / "start.py").read_text(encoding="utf-8")
     dockerfile = (ROOT / "csi" / "Dockerfile").read_text(encoding="utf-8")
@@ -145,6 +257,11 @@ def test_native_mount_rechecks_established_mount_while_holding_lock(
         volumeutils,
         "execute",
         lambda *_args: pytest.fail("duplicate mount launched"),
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "_remove_stale_gluster_mount",
+        lambda *_args: None,
     )
 
     mountpoint = str(tmp_path / "mount")
@@ -235,6 +352,180 @@ def test_native_mount_propagates_unreachable_servers(monkeypatch, tmp_path):
     assert error.value.ret == -1
 
 
+def test_native_mount_detaches_stale_fuse_target_before_launch(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    volume = _native_volume(tmp_path, volumeutils)
+    mountpoint = str(tmp_path / "bellagio-mount")
+    events = []
+
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_established",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(volumeutils, "is_server_pod_reachable", lambda *_args: True)
+    monkeypatch.setattr(
+        volumeutils,
+        "_remove_stale_gluster_mount",
+        lambda volname, target: events.append(("detach", volname, target)),
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "_execute_glusterfs_mount",
+        lambda _command, volname, target:
+            events.append(("launch", volname, target)),
+    )
+
+    assert volumeutils.mount_glusterfs(volume, mountpoint) == mountpoint
+    assert events == [
+        ("detach", "bellagio-pool", mountpoint),
+        ("launch", "bellagio-pool", mountpoint),
+    ]
+
+
+def test_native_mount_never_probes_stale_fuse_path_before_detach(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    volume = _native_volume(tmp_path, volumeutils)
+    mountpoint = str(tmp_path / "bellagio-stale-mount")
+    stale = True
+    original_exists = volumeutils.os.path.exists
+    events = []
+
+    def guarded_exists(path):
+        if stale and str(path) == mountpoint:
+            raise OSError(errno.ENOTCONN, "the fake FUSE client disconnected")
+        return original_exists(path)
+
+    def remove_stale(volname, target):
+        nonlocal stale
+        events.append(("detach", volname, target))
+        stale = False
+
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_established",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(volumeutils, "is_server_pod_reachable", lambda *_args: True)
+    monkeypatch.setattr(volumeutils.os.path, "exists", guarded_exists)
+    monkeypatch.setattr(volumeutils, "_remove_stale_gluster_mount", remove_stale)
+    monkeypatch.setattr(
+        volumeutils,
+        "_execute_glusterfs_mount",
+        lambda _command, volname, target:
+            events.append(("launch", volname, target)),
+    )
+
+    assert volumeutils.mount_glusterfs(volume, mountpoint) == mountpoint
+    assert events == [
+        ("detach", "bellagio-pool", mountpoint),
+        ("launch", "bellagio-pool", mountpoint),
+    ]
+
+
+def test_stale_cleanup_refuses_to_unmount_a_different_gluster_volume(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    mountpoint = tmp_path / "bellagio-mount"
+    mounts_file = tmp_path / "mounts"
+    mounts_file.write_text(
+        f"kadalu:benedicts-vault {mountpoint} "
+        "fuse.glusterfs rw,relatime 0 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(volumeutils, "MOUNTS_FILE", str(mounts_file))
+    monkeypatch.setattr(
+        volumeutils,
+        "execute",
+        lambda *_args: pytest.fail("a different healthy mount was unmounted"),
+    )
+
+    with pytest.raises(volumeutils.MountTargetConflictError):
+        volumeutils._remove_stale_gluster_mount(
+            "bellagio-pool",
+            str(mountpoint),
+        )
+
+
+def test_capacity_accounting_uses_statvfs_fragment_size(monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    pool = "bellagio-capacity-pool"
+    mount_root = tmp_path / "mnt"
+    pool_root = mount_root / pool
+    pool_root.mkdir(parents=True)
+    monkeypatch.setattr(volumeutils, "HOSTVOL_MOUNTDIR", str(mount_root))
+    monkeypatch.setattr(
+        volumeutils,
+        "mount_glusterfs",
+        lambda _volume, mountpoint: mountpoint,
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "retry_errors",
+        lambda function, args, _errors: function(*args),
+    )
+    monkeypatch.setattr(
+        volumeutils.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_blocks=100,
+            f_bsize=4096,
+            f_frsize=10,
+        ),
+    )
+
+    selected = volumeutils.mount_and_select_hosting_volume(
+        [{"name": pool, "type": "Replica1"}],
+        950,
+    )
+
+    assert selected is None
+    with volumeutils.SizeAccounting(pool, str(pool_root)) as accounting:
+        assert accounting.get_stats()["total_size_bytes"] == 1000
+
+
+def test_simple_quota_verification_uses_statvfs_fragment_size(
+        monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    stats = SimpleNamespace(f_blocks=100, f_bsize=4096, f_frsize=10)
+    monkeypatch.setattr(
+        volumeutils,
+        "retry_errors",
+        lambda _function, _args, _errors: stats,
+    )
+    monkeypatch.setattr(
+        volumeutils.time,
+        "sleep",
+        lambda _seconds: pytest.fail("correct quota capacity was not observed"),
+    )
+
+    volumeutils._wait_for_simple_quota(
+        "/mnt/bellagio",
+        "subvol/aa/bb/pvc-rusty-ryan",
+        1000,
+        "creation",
+    )
+
+
+def test_successful_gluster_command_requires_kernel_mount(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    monkeypatch.setattr(volumeutils, "execute", lambda *_args: ("", "", 101))
+    monkeypatch.setattr(
+        volumeutils,
+        "_wait_for_gluster_mount",
+        lambda *_args: False,
+    )
+
+    with pytest.raises(volumeutils.CommandException, match="without establishing"):
+        volumeutils._execute_glusterfs_mount(
+            ["glusterfs", "/mnt/bellagio"],
+            "bellagio-vault",
+            "/mnt/bellagio",
+        )
+
+
 @pytest.mark.parametrize("mount_established", [True, False])
 def test_native_mount_accepts_exit_32_only_for_established_mount(
         monkeypatch, tmp_path, mount_established):
@@ -276,6 +567,11 @@ def test_external_mount_returns_after_retry_without_rejected_options(
         return "", "", 101
 
     monkeypatch.setattr(volumeutils, "execute", execute)
+    monkeypatch.setattr(
+        volumeutils,
+        "_wait_for_gluster_mount",
+        lambda *_args: True,
+    )
     mountpoint = str(tmp_path / "mount")
 
     assert volumeutils.mount_glusterfs_with_host(

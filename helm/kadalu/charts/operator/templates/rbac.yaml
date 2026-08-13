@@ -23,6 +23,7 @@ rules:
     verbs:
       - get
       - list
+      - patch
 ---
 # Compatibility revocation for upgrades from releases that deployed the
 # external-attacher. Applying this empty role removes its old cluster-wide

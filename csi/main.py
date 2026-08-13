@@ -13,8 +13,8 @@ from controllerserver import ControllerServer
 from identityserver import IdentityServer
 from kadalulib import CommandException, logf, logging_setup
 from nodeserver import NodeServer
-from volumeutils import (HOSTVOL_MOUNTDIR, get_pv_hosting_volumes,
-                         mount_glusterfs)
+from volumeutils import (HOSTVOL_MOUNTDIR, MountTargetConflictError,
+                         get_pv_hosting_volumes, mount_glusterfs)
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 
@@ -43,8 +43,17 @@ def mount_storage():
         try:
             mount_glusterfs(volume, mntdir)
             logging.info(logf("Volume is mounted successfully", hvol=hvol))
-        except CommandException:
-            logging.error(logf("Unable to mount volume", hvol=hvol))
+        except (
+                CommandException,
+                MountTargetConflictError,
+                OSError,
+                ValueError,
+        ) as err:
+            logging.error(logf(
+                "Unable to mount volume",
+                hvol=hvol,
+                error=err,
+            ))
     return
 
 

@@ -77,18 +77,6 @@ spec:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
           image: {{ images_hub }}/{{ docker_user }}/kadalu-csi:{{ kadalu_version }}
-          lifecycle:
-            postStart:
-              exec:
-                command:
-                  - /bin/sh
-                  - '-c'
-                  - >
-                    mount | grep glusterfs | awk '{print $1 " " $3}' | sed 's/:/
-                    /' | awk '{print "umount " $3 ";glusterfs --process-name
-                    fuse --volfile-id " $2 " --volfile-server " $1 "
-                    --log-level=WARNING " $3}' > /tmp/remount.sh ; chmod +x
-                    /tmp/remount.sh ; /tmp/remount.sh
           env:
             - name: NODE_ID
               valueFrom:
@@ -186,7 +174,10 @@ metadata:
     app.kubernetes.io/name: kadalu-csi-provisioner
 spec:
   serviceName: kadalu-csi-provisioner
-  replicas: 1
+  # CreateVolume's cross-pool name lock is local to this controller pod. The
+  # operator uses zero replicas only as an upgrade fence; every serving state
+  # is therefore clamped to exactly one controller pod.
+  replicas: {{ 0 if provisioner_replicas | default(1) == 0 else 1 }}
   selector:
     matchLabels:
       app.kubernetes.io/part-of: kadalu
@@ -277,6 +268,8 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /plugin
+            - name: create-identity-locks
+              mountPath: /var/lib/kadalu/create-locks
             - name: glusterfsd-volfilesdir
               mountPath: "/var/lib/gluster"
             - name: gluster-dev
@@ -336,6 +329,8 @@ spec:
       volumes:
         - name: socket-dir
           emptyDir:
+        - name: create-identity-locks
+          emptyDir: {}
         - name: glusterfsd-volfilesdir
           configMap:
             name: "kadalu-info"

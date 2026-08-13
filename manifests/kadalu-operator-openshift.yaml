@@ -171,6 +171,7 @@ rules:
     verbs:
       - get
       - list
+      - patch
 ---
 # Source: kadalu/charts/operator/templates/rbac.yaml
 # Compatibility revocation for upgrades from releases that deployed the

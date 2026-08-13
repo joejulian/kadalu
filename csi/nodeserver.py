@@ -1,25 +1,74 @@
 """
 nodeserver implementation
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import errno
+import functools
 import json
 import logging
 import os
 import stat
+import threading
 import time
 
 import csi_pb2
 import csi_pb2_grpc
 import grpc
 from kadalulib import (PV_TYPE_RAWBLOCK, PV_TYPE_SUBVOL, PV_TYPE_VIRTBLOCK,
+                       CommandException, get_legacy_volume_path,
                        get_single_pv_per_pool, get_volname_hash,
-                       get_volume_path, logf)
-from volumeutils import mount_glusterfs, mount_volume, unmount_volume
+                       get_volume_path, is_safe_path_component,
+                       is_valid_csi_identifier, logf)
+from volumeutils import (MountTargetConflictError, ensure_single_pv_claim,
+                         legacy_mount_fallback_authorized, mount_glusterfs,
+                         mount_identity_token, mount_volume, single_pv_claim_matches,
+                         single_pv_operation_lock, target_path_is_mounted,
+                         unmount_volume)
 
 HOSTVOL_MOUNTDIR = "/mnt"
 VOLINFO_DIR = "/var/lib/gluster"
 KUBELET_DIR = os.environ.get("KUBELET_DIR", "/var/lib/kubelet")
+CSI_MOUNT_DIR = os.environ.get("CSI_MOUNT_DIR")
 VALID_PV_TYPES = (PV_TYPE_SUBVOL, PV_TYPE_VIRTBLOCK, PV_TYPE_RAWBLOCK)
+TARGET_LOCKS = {}
+TARGET_LOCKS_GUARD = threading.Lock()
+
+
+class VolumeSourceNotFoundError(Exception):
+    """Raised when a controller-managed volume source no longer exists."""
+
+
+@contextmanager
+def _target_operation_lock(target_path):
+    """Serialize publish lifecycle changes for one normalized target path."""
+    key = os.path.normpath(os.path.abspath(target_path or os.curdir))
+    with TARGET_LOCKS_GUARD:
+        entry = TARGET_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            TARGET_LOCKS[key] = entry
+        entry[1] += 1
+
+    target_lock = entry[0]
+    target_lock.acquire()
+    try:
+        yield
+    finally:
+        target_lock.release()
+        with TARGET_LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] == 0 and TARGET_LOCKS.get(key) is entry:
+                del TARGET_LOCKS[key]
+
+
+def serialized_target_operation(method):
+    """Serialize a node RPC against other operations on the same target."""
+    @functools.wraps(method)
+    def locked_method(self, request, context):
+        with _target_operation_lock(request.target_path):
+            return method(self, request, context)
+
+    return locked_method
 
 
 def _is_within(path, parent):
@@ -32,54 +81,64 @@ def _is_within(path, parent):
 
 def _is_safe_component(value):
     """Return whether a CSI identifier is one safe path component."""
-    separators = (os.sep,) if os.altsep is None else (os.sep, os.altsep)
-    return bool(value) and not (
-        "\0" in value
-        or value in (os.curdir, os.pardir)
-        or os.path.isabs(value)
-        or any(separator in value for separator in separators)
-    )
+    return is_safe_path_component(value)
 
 
-def _single_pv_pool_is_authoritative(hostvol):
-    """Read the operator-managed pool record, not the CSI request flag."""
+def _pool_record(hostvol):
+    """Return a validated operator-managed hosting-pool record."""
+    if not _is_safe_component(hostvol):
+        raise ValueError("hostvol must be a non-empty path component")
     info_path = os.path.join(VOLINFO_DIR, f"{hostvol}.info")
-    try:
-        with open(info_path, encoding="utf-8") as info_file:
-            return get_single_pv_per_pool(json.load(info_file)) is True
-    except (OSError, ValueError, TypeError):
-        return False
+    with open(info_path, encoding="utf-8") as info_file:
+        record = json.load(info_file)
+    if not isinstance(record, dict):
+        raise ValueError("hosting-pool record must be an object")
+    get_single_pv_per_pool(record)
+    return record
 
 
-def _validate_volume_paths(volume_id, hostvol, pvpath, pvtype):
+def _validate_volume_paths(volume_id, hostvol, pvpath, pvtype, pool_record=None):
     """Build mount paths after rejecting unsafe CSI volume context values."""
     if not _is_safe_component(hostvol):
         raise ValueError("hostvol must be a non-empty path component")
 
-    if not _is_safe_component(volume_id):
-        raise ValueError("volume ID must be a non-empty path component")
+    if not is_valid_csi_identifier(volume_id):
+        raise ValueError("volume ID does not satisfy the CSI identifier contract")
 
     if pvtype not in VALID_PV_TYPES:
         raise ValueError("pvtype is not supported")
 
+    if pool_record is None:
+        pool_record = _pool_record(hostvol)
+    single_pv_pool = get_single_pv_per_pool(pool_record)
+    if pvpath and single_pv_pool:
+        raise ValueError("single-PV pools require an empty volume path")
     if pvpath:
-        expected_path = get_volume_path(
+        expected_paths = {get_volume_path(
+            pvtype,
+            get_volname_hash(volume_id),
+            volume_id,
+        )}
+        legacy_path = get_legacy_volume_path(
             pvtype,
             get_volname_hash(volume_id),
             volume_id,
         )
-        if pvpath != expected_path:
+        if legacy_path is not None:
+            expected_paths.add(legacy_path)
+        if pvpath not in expected_paths:
             raise ValueError("path does not match the controller-generated path")
-    elif not _single_pv_pool_is_authoritative(hostvol):
+    elif not single_pv_pool:
         raise ValueError("empty path requires an authoritative single-PV pool")
 
     mount_root = os.path.abspath(HOSTVOL_MOUNTDIR)
     real_mount_root = os.path.realpath(mount_root)
     mntdir = os.path.join(mount_root, hostvol)
-    real_mntdir = os.path.realpath(mntdir)
-    expected_real_mntdir = os.path.join(real_mount_root, hostvol)
-    if real_mntdir != expected_real_mntdir:
-        raise ValueError("hostvol must not resolve through a symbolic link")
+    if not target_path_is_mounted(mntdir):
+        real_mntdir = os.path.realpath(mntdir)
+        expected_real_mntdir = os.path.join(real_mount_root, hostvol)
+        if real_mntdir != expected_real_mntdir:
+            raise ValueError("hostvol must not resolve through a symbolic link")
 
     pvpath_full = os.path.normpath(os.path.join(mntdir, pvpath))
     if not _is_within(pvpath_full, mntdir):
@@ -145,7 +204,9 @@ def _pinned_volume_source(mntdir, pvpath_full, pvtype):
 
         yield f"/proc/{os.getpid()}/fd/{current_fd}"
     except FileNotFoundError as err:
-        raise ValueError("volume source path does not exist") from err
+        raise VolumeSourceNotFoundError(
+            "volume source path does not exist"
+        ) from err
     except NotADirectoryError as err:
         raise ValueError("volume source path has an invalid component") from err
     finally:
@@ -155,6 +216,9 @@ def _pinned_volume_source(mntdir, pvpath_full, pvtype):
 
 def _target_roots():
     """Return the host-backed roots mounted into the node plugin."""
+    if CSI_MOUNT_DIR:
+        return (os.path.abspath(CSI_MOUNT_DIR),)
+
     kubelet_dir = os.path.abspath(KUBELET_DIR)
     return (
         os.path.join(kubelet_dir, "pods"),
@@ -179,9 +243,21 @@ def _validate_target_path(target_path):
         relative_path = os.path.relpath(normalized_target, root)
         if relative_path == os.curdir:
             raise ValueError("target path must be below a kubelet mount root")
-        expected_real_target = os.path.join(real_root, relative_path)
-        if os.path.realpath(normalized_target) != expected_real_target:
+        relative_parent = os.path.dirname(relative_path)
+        target_parent = os.path.dirname(normalized_target)
+        expected_real_parent = os.path.normpath(os.path.join(
+            real_root,
+            relative_parent,
+        ))
+        if os.path.realpath(target_parent) != expected_real_parent:
             raise ValueError("target path must not contain symbolic links")
+        if not target_path_is_mounted(normalized_target):
+            try:
+                target_stat = os.lstat(normalized_target)
+            except (FileNotFoundError, PermissionError):
+                target_stat = None
+            if target_stat is not None and stat.S_ISLNK(target_stat.st_mode):
+                raise ValueError("target path must not be a symbolic link")
         # Kubelet creates these root-owned target parents. Unlike the source,
         # pinning a not-yet-created mount target would break CSI idempotency;
         # an actor able to rename these host paths already has node-level
@@ -201,7 +277,8 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
     Ref:https://github.com/container-storage-interface/spec/blob/master/spec.md
     """
     # Each invalid CSI field is reported through the gRPC context immediately.
-    # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-branches,too-many-return-statements
+    @serialized_target_operation
     def NodePublishVolume(self, request, context):
         start_time = time.time()
         if not request.volume_id:
@@ -236,18 +313,45 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
         pvpath = request.volume_context.get("path", "")
         pvtype = request.volume_context.get("pvtype", "")
         voltype = request.volume_context.get("type", "")
-        gserver = request.volume_context.get("gserver", None)
-        gvolname = request.volume_context.get("gvolname", None)
-        options = request.volume_context.get("options", None)
+        access_type = request.volume_capability.WhichOneof("access_type")
+        expected_access_type = (
+            "block" if pvtype == PV_TYPE_RAWBLOCK else "mount"
+        )
+        if access_type != expected_access_type:
+            errmsg = f"{pvtype} requires {expected_access_type} capability"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return csi_pb2.NodePublishVolumeResponse()
+
+        fstype = None
+        mount_flags = []
+        if access_type == "mount":
+            fstype = request.volume_capability.mount.fs_type or None
+            mount_flags = list(request.volume_capability.mount.mount_flags)
+            if pvtype == PV_TYPE_VIRTBLOCK and fstype not in (None, "xfs"):
+                errmsg = "virtblock volumes require the xfs filesystem type"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                return csi_pb2.NodePublishVolumeResponse()
 
         try:
             target_path = _validate_target_path(request.target_path)
+            pool_record = _pool_record(hostvol)
             mntdir, pvpath_full = _validate_volume_paths(
                 request.volume_id,
                 hostvol,
                 pvpath,
                 pvtype,
+                pool_record,
             )
+        except FileNotFoundError as err:
+            errmsg = f"Hosting-pool configuration was not found: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            return csi_pb2.NodePublishVolumeResponse()
         except ValueError as err:
             errmsg = f"Invalid volume context: {err}"
             logging.error(errmsg)
@@ -265,15 +369,89 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
             pvpath_full=pvpath_full
         ))
 
+        if pool_record.get("type") != voltype:
+            errmsg = "Volume context does not match the hosting-pool type"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            return csi_pb2.NodePublishVolumeResponse()
+
+        # Backend endpoints and options are operator-owned configuration. A
+        # stale or forged PV context must never redirect the node plugin.
         volume = {
+            **pool_record,
             'name': hostvol,
-            'g_volname': gvolname,
-            'g_host': gserver,
-            'g_options': options,
-            'type': voltype,
+            'g_volname': pool_record.get('gluster_volname'),
+            'g_host': pool_record.get('gluster_hosts'),
+            'g_options': pool_record.get('gluster_options', ''),
+            'mount_identity': pool_record.get('mount_identity'),
+            'type': pool_record['type'],
         }
 
-        mount_glusterfs(volume, mntdir, True)
+        try:
+            mount_glusterfs(volume, mntdir, True)
+        except MountTargetConflictError as err:
+            errmsg = f"Hosting-volume target is already occupied: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+            return csi_pb2.NodePublishVolumeResponse()
+        except CommandException as err:
+            errmsg = f"Unable to mount hosting volume: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.UNAVAILABLE)
+            return csi_pb2.NodePublishVolumeResponse()
+        except ValueError as err:
+            errmsg = f"Invalid hosting-pool configuration: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return csi_pb2.NodePublishVolumeResponse()
+        except OSError as err:
+            errmsg = f"Unable to mount hosting volume: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            transient_errors = {
+                errno.EIO,
+                errno.ENOTCONN,
+                errno.ESTALE,
+                errno.ETIMEDOUT,
+                errno.EHOSTUNREACH,
+            }
+            context.set_code(
+                grpc.StatusCode.UNAVAILABLE
+                if err.errno in transient_errors
+                else grpc.StatusCode.INTERNAL
+            )
+            return csi_pb2.NodePublishVolumeResponse()
+
+        if not pvpath:
+            try:
+                claim_matches = ensure_single_pv_claim(
+                    mntdir,
+                    request.volume_id,
+                    pool_record.get("legacy_single_pv_volume_id"),
+                )
+            except OSError as err:
+                errmsg = f"Unable to read single-PV ownership: {err}"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                return csi_pb2.NodePublishVolumeResponse()
+            except ValueError as err:
+                errmsg = f"Invalid single-PV ownership: {err}"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.INTERNAL)
+                return csi_pb2.NodePublishVolumeResponse()
+
+            if not claim_matches:
+                errmsg = "Single-PV pool is not owned by this volume ID"
+                logging.error(errmsg)
+                context.set_details(errmsg)
+                context.set_code(grpc.StatusCode.NOT_FOUND)
+                return csi_pb2.NodePublishVolumeResponse()
 
         try:
             _validate_resolved_volume_path(mntdir, pvpath_full)
@@ -299,29 +477,104 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
             mntdir=mntdir
         ))
         try:
-            # Hold the source inode open so it cannot be replaced between the
-            # checks above and mount(8) resolving the source path.
-            with _pinned_volume_source(mntdir, pvpath_full, pvtype) as source:
-                mounted = mount_volume(
-                    source,
-                    target_path,
-                    pvtype,
-                    fstype=None,
-                )
-        except (OSError, ValueError) as err:
+            claim_guard = (
+                single_pv_operation_lock(mntdir)
+                if not pvpath
+                else nullcontext()
+            )
+            with claim_guard:
+                if (
+                        not pvpath
+                        and not single_pv_claim_matches(
+                            mntdir,
+                            request.volume_id,
+                        )):
+                    raise VolumeSourceNotFoundError(
+                        "single-PV ownership changed before publish"
+                    )
+
+                # Hold the source inode open so it cannot be replaced between
+                # validation and mount(8) resolving the source path.
+                with _pinned_volume_source(
+                        mntdir, pvpath_full, pvtype) as source:
+                    if (
+                            not pvpath
+                            and not single_pv_claim_matches(
+                                mntdir,
+                                request.volume_id,
+                            )):
+                        raise VolumeSourceNotFoundError(
+                            "single-PV ownership changed before mount"
+                        )
+                    mounted = mount_volume(
+                        source,
+                        target_path,
+                        pvtype,
+                        fstype=fstype,
+                        readonly=request.readonly,
+                        mount_flags=mount_flags,
+                        logical_source_path=pvpath_full,
+                        volume_path=pvpath,
+                        host_volume_name=(
+                            pool_record.get("gluster_volname")
+                            if pool_record.get("type") == "External"
+                            else hostvol
+                        ),
+                        host_mount_identity=mount_identity_token(pool_record),
+                        volume_id=request.volume_id,
+                        allow_legacy_host_mount=(
+                            legacy_mount_fallback_authorized(pool_record)
+                        ),
+                    )
+        except VolumeSourceNotFoundError as err:
+            errmsg = f"Volume source was not found: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            return csi_pb2.NodePublishVolumeResponse()
+        except MountTargetConflictError as err:
+            errmsg = f"Target already has an incompatible mount: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.ALREADY_EXISTS)
+            return csi_pb2.NodePublishVolumeResponse()
+        except CommandException as err:
+            errmsg = f"Unable to publish volume: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return csi_pb2.NodePublishVolumeResponse()
+        except ValueError as err:
             errmsg = f"Invalid volume source: {err}"
             logging.error(errmsg)
             context.set_details(errmsg)
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             return csi_pb2.NodePublishVolumeResponse()
-
-        # Mount the PV
-        # TODO: Handle Volume capability mount flags
-        if not mounted:
-            errmsg = "Unable to bind PV to target path"
+        except OSError as err:
+            errmsg = f"Unable to access volume source: {err}"
             logging.error(errmsg)
             context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            transient_errors = {
+                errno.EIO,
+                errno.ENOTCONN,
+                errno.ESTALE,
+                errno.ETIMEDOUT,
+                errno.EHOSTUNREACH,
+            }
+            status = (
+                grpc.StatusCode.UNAVAILABLE
+                if err.errno in transient_errors
+                else grpc.StatusCode.INTERNAL
+            )
+            context.set_code(status)
+            return csi_pb2.NodePublishVolumeResponse()
+
+        # Mount the PV
+        if not mounted:
+            errmsg = "Volume source was not found"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.NOT_FOUND)
             return csi_pb2.NodePublishVolumeResponse()
 
         logging.info(logf(
@@ -336,6 +589,7 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
         return csi_pb2.NodePublishVolumeResponse()
 
 
+    @serialized_target_operation
     def NodeUnpublishVolume(self, request, context):
         # TODO: Validation and handle target_path failures
 
@@ -367,7 +621,31 @@ class NodeServer(csi_pb2_grpc.NodeServicer):
             request=request,
         ))
 
-        unmount_volume(target_path)
+        try:
+            unmount_volume(target_path)
+        except CommandException as err:
+            errmsg = f"Unable to unpublish volume: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            return csi_pb2.NodeUnpublishVolumeResponse()
+        except OSError as err:
+            errmsg = f"Unable to remove publish target: {err}"
+            logging.error(errmsg)
+            context.set_details(errmsg)
+            transient_errors = {
+                errno.EIO,
+                errno.ENOTCONN,
+                errno.ESTALE,
+                errno.ETIMEDOUT,
+                errno.EHOSTUNREACH,
+            }
+            context.set_code(
+                grpc.StatusCode.UNAVAILABLE
+                if err.errno in transient_errors
+                else grpc.StatusCode.INTERNAL
+            )
+            return csi_pb2.NodeUnpublishVolumeResponse()
         # Hosting-volume Gluster mounts are intentionally retained. A
         # concurrent NodePublishVolume may already be using the shared client,
         # and eager "last user" detection cannot be made atomic with kubelet's
