@@ -28,6 +28,7 @@ RESERVED_SIZE_PERCENTAGE = 10
 HOSTVOL_MOUNTDIR = "/mnt"
 VOLFILES_DIR = "/kadalu/volfiles"
 VOLINFO_DIR = "/var/lib/gluster"
+MOUNTS_FILE = "/proc/self/mounts"
 
 statfile_lock = threading.Lock()    # noqa # pylint: disable=invalid-name
 mount_lock = threading.Lock()    # noqa # pylint: disable=invalid-name
@@ -902,9 +903,64 @@ def mount_volume(pvpath, mountpoint, pvtype, fstype=None):
     return True
 
 
+def _unescape_mount_field(value):
+    """Decode the octal escapes used in procfs mount-table fields."""
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
+    )
+
+
+def _gluster_volume_name(source):
+    """Return the exact Gluster volume component from a mount source."""
+    _, separator, remote_path = source.rpartition(":")
+    if not separator:
+        return None
+    return remote_path.lstrip("/") or None
+
+
+def _read_gluster_mounts():
+    """Return Gluster mount source and normalized target pairs."""
+    mounts = []
+    with open(MOUNTS_FILE, encoding="utf-8") as mounts_file:
+        for line in mounts_file:
+            fields = line.split()
+            if len(fields) < 3 or fields[2] != "fuse.glusterfs":
+                continue
+            mounts.append((
+                _unescape_mount_field(fields[0]),
+                os.path.normpath(_unescape_mount_field(fields[1])),
+            ))
+    return mounts
+
+
+def _has_exact_gluster_mount(volname, mountpoint):
+    """Return whether procfs records this volume at this exact target."""
+    expected_target = os.path.normpath(os.path.abspath(mountpoint))
+    return any(
+        target == expected_target and _gluster_volume_name(source) == volname
+        for source, target in _read_gluster_mounts()
+    )
+
+
+def is_gluster_mount_established(volname, mountpoint):
+    """Require both the exact Gluster process and kernel mount record.
+
+    Deliberately avoid probing through the FUSE filesystem here. A stat can
+    block or return ENOTCONN while an established client reconnects, which
+    must not launch a duplicate client during a temporary server outage.
+    """
+    normalized_target = os.path.normpath(os.path.abspath(mountpoint))
+    return (
+        is_gluster_mount_proc_running(volname, normalized_target)
+        and _has_exact_gluster_mount(volname, normalized_target)
+    )
+
+
 def unmount_glusterfs(mountpoint,volname):
     """Unmount GlusterFS mount"""
-    if is_gluster_mount_proc_running(volname, mountpoint):
+    if _has_exact_gluster_mount(volname, mountpoint):
         logging.debug(
             logf("Executing unmount",
                  volname=volname,
@@ -947,7 +1003,7 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
 
     # An existing client remains useful while its servers reconnect. Only
     # require a reachable volfile server when a new Gluster client is needed.
-    if is_gluster_mount_proc_running(volname, mountpoint):
+    if is_gluster_mount_established(volname, mountpoint):
         logging.debug(logf(
             "Already mounted",
             mount=mountpoint
@@ -974,7 +1030,7 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
     with mount_lock:
         # Another request may have mounted this volume while this request was
         # waiting for the lock.
-        if is_gluster_mount_proc_running(volname, mountpoint):
+        if is_gluster_mount_established(volname, mountpoint):
             logging.debug(logf(
                 "Already mounted after waiting for mount lock",
                 mount=mountpoint
@@ -1030,7 +1086,7 @@ def handle_external_volume(volume, mountpoint, is_client, hosts):
 
     # Try to mount the Host Volume, handle failure if
     # already mounted
-    if is_gluster_mount_proc_running(volname, mountpoint):
+    if is_gluster_mount_established(volname, mountpoint):
         logging.debug(logf(
             "Already mounted",
             mount=mountpoint
@@ -1038,7 +1094,7 @@ def handle_external_volume(volume, mountpoint, is_client, hosts):
         return mountpoint
 
     with mount_lock:
-        if is_gluster_mount_proc_running(volname, mountpoint):
+        if is_gluster_mount_established(volname, mountpoint):
             logging.debug(logf(
                 "Already mounted after waiting for mount lock",
                 mount=mountpoint
@@ -1096,7 +1152,7 @@ def _mount_succeeded_after_command_error(error, volname, mountpoint):
     if error.ret != 32:
         return False
 
-    if not is_gluster_mount_proc_running(volname, mountpoint):
+    if not is_gluster_mount_established(volname, mountpoint):
         return False
 
     logging.info(logf(
@@ -1132,6 +1188,7 @@ def mount_glusterfs_with_host(volname, mountpoint, hosts, options=None, is_clien
         "--process-name", "fuse",
         "-l", "%s" % log_file,
         "--volfile-id", volname,
+        "--fs-display-name", "kadalu:%s" % volname,
     ]
     ## on server component we can mount glusterfs with client-pid
     #if not is_client:

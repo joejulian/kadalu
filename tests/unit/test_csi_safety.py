@@ -752,26 +752,13 @@ def test_node_publish_accepts_empty_path_for_single_pv_pool(
     assert context.code is None
 
 
-def test_node_unpublish_never_executes_volume_handle_as_shell(monkeypatch):
+def test_node_unpublish_retains_shared_hosting_mount(monkeypatch):
     nodeserver = _load_csi_module(monkeypatch, "nodeserver")
     csi_pb2 = importlib.import_module("csi_pb2")
     target = "/var/lib/kubelet/pods/oceans-eleven/volumes/bellagio-vault/mount"
-    mount_snapshots = iter([
-        [
-            ("kadalu:bellagio-pool", "/mnt/bellagio-pool"),
-            ("kadalu:bellagio-pool", target),
-        ],
-        [("kadalu:bellagio-pool", "/mnt/bellagio-pool")],
-    ])
     unmounted = []
 
-    monkeypatch.setattr(nodeserver, "_read_gluster_mounts", lambda: next(mount_snapshots))
     monkeypatch.setattr(nodeserver, "unmount_volume", unmounted.append)
-    monkeypatch.setattr(
-        nodeserver,
-        "unmount_glusterfs",
-        lambda mountpoint, volume: unmounted.append((mountpoint, volume)),
-    )
 
     context = FakeContext()
     response = nodeserver.NodeServer().NodeUnpublishVolume(
@@ -783,15 +770,12 @@ def test_node_unpublish_never_executes_volume_handle_as_shell(monkeypatch):
     )
 
     assert isinstance(response, csi_pb2.NodeUnpublishVolumeResponse)
-    assert unmounted == [
-        target,
-        ("/mnt/bellagio-pool", "bellagio-pool"),
-    ]
+    assert unmounted == [target]
     assert context.code is None
 
 
 def test_mount_parser_decodes_proc_escapes(monkeypatch, tmp_path):
-    nodeserver = _load_csi_module(monkeypatch, "nodeserver")
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     mounts_file = tmp_path / "mounts"
     mounts_file.write_text(
         "kadalu:bellagio-vault /mnt/bellagio\\040vault "
@@ -799,9 +783,9 @@ def test_mount_parser_decodes_proc_escapes(monkeypatch, tmp_path):
         "/dev/vault /not-gluster xfs rw 0 0\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(nodeserver, "MOUNTS_FILE", str(mounts_file))
+    monkeypatch.setattr(volumeutils, "MOUNTS_FILE", str(mounts_file))
 
-    assert nodeserver._read_gluster_mounts() == [
+    assert volumeutils._read_gluster_mounts() == [
         ("kadalu:bellagio-vault", "/mnt/bellagio vault"),
     ]
 

@@ -123,19 +123,24 @@ def test_obsolete_configmap_watcher_is_not_packaged_or_started():
     assert not (ROOT / "csi" / "watch-vol-changes.sh").exists()
 
 
-def test_native_mount_rechecks_process_while_holding_lock(monkeypatch, tmp_path):
+def test_native_mount_rechecks_established_mount_while_holding_lock(
+        monkeypatch, tmp_path):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     volume = _native_volume(tmp_path, volumeutils)
     lock = TrackingLock()
     checks = []
 
-    def process_running(_volname, _mountpoint):
+    def mount_established(_volname, _mountpoint):
         checks.append(lock.held)
         return len(checks) == 2
 
     monkeypatch.setattr(volumeutils, "mount_lock", lock)
     monkeypatch.setattr(volumeutils, "is_server_pod_reachable", lambda *_args: True)
-    monkeypatch.setattr(volumeutils, "is_gluster_mount_proc_running", process_running)
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_established",
+        mount_established,
+    )
     monkeypatch.setattr(
         volumeutils,
         "execute",
@@ -155,7 +160,7 @@ def test_existing_native_mount_does_not_require_reachable_server(
 
     monkeypatch.setattr(
         volumeutils,
-        "is_gluster_mount_proc_running",
+        "is_gluster_mount_established",
         lambda volname, path: (
             volname == volume["name"] and path == mountpoint
         ),
@@ -174,18 +179,23 @@ def test_existing_native_mount_does_not_require_reachable_server(
     assert volumeutils.mount_glusterfs(volume, mountpoint) == mountpoint
 
 
-def test_external_mount_rechecks_process_while_holding_lock(monkeypatch):
+def test_external_mount_rechecks_established_mount_while_holding_lock(
+        monkeypatch):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     volume = _external_volume()
     lock = TrackingLock()
     checks = []
 
-    def process_running(_volname, _mountpoint):
+    def mount_established(_volname, _mountpoint):
         checks.append(lock.held)
         return len(checks) == 2
 
     monkeypatch.setattr(volumeutils, "mount_lock", lock)
-    monkeypatch.setattr(volumeutils, "is_gluster_mount_proc_running", process_running)
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_established",
+        mount_established,
+    )
     monkeypatch.setattr(
         volumeutils,
         "mount_glusterfs_with_host",
@@ -207,6 +217,11 @@ def test_external_mount_rechecks_process_while_holding_lock(monkeypatch):
 def test_native_mount_propagates_unreachable_servers(monkeypatch, tmp_path):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     volume = _native_volume(tmp_path, volumeutils)
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_established",
+        lambda *_args: False,
+    )
     monkeypatch.setattr(volumeutils, "is_server_pod_reachable", lambda *_args: False)
     monkeypatch.setattr(
         volumeutils,
@@ -220,16 +235,16 @@ def test_native_mount_propagates_unreachable_servers(monkeypatch, tmp_path):
     assert error.value.ret == -1
 
 
-@pytest.mark.parametrize("process_started", [True, False])
-def test_native_mount_accepts_exit_32_only_for_exact_started_process(
-        monkeypatch, tmp_path, process_started):
+@pytest.mark.parametrize("mount_established", [True, False])
+def test_native_mount_accepts_exit_32_only_for_established_mount(
+        monkeypatch, tmp_path, mount_established):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     volume = _native_volume(tmp_path, volumeutils)
-    checks = iter([False, False, process_started])
+    checks = iter([False, False, mount_established])
     monkeypatch.setattr(volumeutils, "is_server_pod_reachable", lambda *_args: True)
     monkeypatch.setattr(
         volumeutils,
-        "is_gluster_mount_proc_running",
+        "is_gluster_mount_established",
         lambda _volname, _mountpoint: next(checks),
     )
     monkeypatch.setattr(
@@ -241,7 +256,7 @@ def test_native_mount_accepts_exit_32_only_for_exact_started_process(
     )
     mountpoint = str(tmp_path / "mount")
 
-    if process_started:
+    if mount_established:
         assert volumeutils.mount_glusterfs(volume, mountpoint) == mountpoint
     else:
         with pytest.raises(volumeutils.CommandException) as error:
@@ -271,11 +286,13 @@ def test_external_mount_returns_after_retry_without_rejected_options(
     ) == mountpoint
     assert "--log-level=WARNING" in commands[0]
     assert "--log-level=WARNING" not in commands[1]
+    display_index = commands[1].index("--fs-display-name")
+    assert commands[1][display_index + 1] == "kadalu:bellagio-vault"
 
 
-@pytest.mark.parametrize("process_started", [True, False])
-def test_external_mount_accepts_exit_32_only_for_exact_started_process(
-        monkeypatch, tmp_path, process_started):
+@pytest.mark.parametrize("mount_established", [True, False])
+def test_external_mount_accepts_exit_32_only_for_established_mount(
+        monkeypatch, tmp_path, mount_established):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     mountpoint = str(tmp_path / "mount")
     monkeypatch.setattr(
@@ -287,15 +304,15 @@ def test_external_mount_accepts_exit_32_only_for_exact_started_process(
     )
     monkeypatch.setattr(
         volumeutils,
-        "is_gluster_mount_proc_running",
+        "is_gluster_mount_established",
         lambda volname, path: (
-            process_started
+            mount_established
             and volname == "bellagio-vault"
             and path == mountpoint
         ),
     )
 
-    if process_started:
+    if mount_established:
         assert volumeutils.mount_glusterfs_with_host(
             "bellagio-vault",
             mountpoint,
@@ -311,9 +328,9 @@ def test_external_mount_accepts_exit_32_only_for_exact_started_process(
         assert error.value.ret == 32
 
 
-@pytest.mark.parametrize("process_started", [True, False])
-def test_external_fallback_accepts_exit_32_only_for_exact_started_process(
-        monkeypatch, tmp_path, process_started):
+@pytest.mark.parametrize("mount_established", [True, False])
+def test_external_fallback_accepts_exit_32_only_for_established_mount(
+        monkeypatch, tmp_path, mount_established):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     commands = []
 
@@ -326,16 +343,16 @@ def test_external_fallback_accepts_exit_32_only_for_exact_started_process(
     monkeypatch.setattr(volumeutils, "execute", execute)
     monkeypatch.setattr(
         volumeutils,
-        "is_gluster_mount_proc_running",
+        "is_gluster_mount_established",
         lambda volname, mountpoint: (
-            process_started
+            mount_established
             and volname == "bellagio-vault"
             and mountpoint == str(tmp_path / "mount")
         ),
     )
     mountpoint = str(tmp_path / "mount")
 
-    if process_started:
+    if mount_established:
         assert volumeutils.mount_glusterfs_with_host(
             "bellagio-vault",
             mountpoint,
@@ -351,3 +368,69 @@ def test_external_fallback_accepts_exit_32_only_for_exact_started_process(
                 "log-level=WARNING",
             )
         assert error.value.ret == 32
+
+
+def test_process_without_mount_table_entry_is_not_established(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    mountpoint = str(tmp_path / "bellagio vault")
+    mounts_file = tmp_path / "mounts"
+    mounts_file.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(volumeutils, "MOUNTS_FILE", str(mounts_file))
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_proc_running",
+        lambda volname, target: (
+            volname == "bellagio-vault" and target == mountpoint
+        ),
+    )
+
+    assert not volumeutils.is_gluster_mount_established(
+        "bellagio-vault",
+        mountpoint,
+    )
+
+
+def test_established_mount_requires_exact_volume_and_normalized_target(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    mountpoint = tmp_path / "bellagio vault"
+    escaped_target = str(mountpoint).replace(" ", r"\040")
+    mounts_file = tmp_path / "mounts"
+    mounts_file.write_text(
+        f"kadalu:bellagio-vault {escaped_target} "
+        "fuse.glusterfs rw,relatime 0 0\n"
+        f"kadalu:bellagio-decoy {escaped_target} "
+        "fuse.glusterfs rw,relatime 0 0\n"
+        f"kadalu:bellagio-vault/roulette {escaped_target} "
+        "fuse.glusterfs rw,relatime 0 0\n",
+        encoding="utf-8",
+    )
+
+    process_targets = []
+
+    def process_running(_volname, target):
+        process_targets.append(target)
+        return True
+
+    monkeypatch.setattr(volumeutils, "MOUNTS_FILE", str(mounts_file))
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_proc_running",
+        process_running,
+    )
+
+    assert volumeutils.is_gluster_mount_established(
+        "bellagio-vault",
+        f"{mountpoint.parent}/./{mountpoint.name}",
+    )
+    assert process_targets[0] == str(mountpoint)
+    assert not volumeutils.is_gluster_mount_established(
+        "bellagio-casino",
+        str(mountpoint),
+    )
+    assert not volumeutils.is_gluster_mount_established(
+        "bellagio-vault",
+        str(tmp_path / "three-casinos"),
+    )
