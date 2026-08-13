@@ -945,6 +945,15 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
     if volume['type'] == 'External':
         return handle_external_volume(volume, mountpoint, is_client, volume['g_host'])
 
+    # An existing client remains useful while its servers reconnect. Only
+    # require a reachable volfile server when a new Gluster client is needed.
+    if is_gluster_mount_proc_running(volname, mountpoint):
+        logging.debug(logf(
+            "Already mounted",
+            mount=mountpoint
+        ))
+        return mountpoint
+
     with open(os.path.join(VOLINFO_DIR, "%s.info" % volname)) as info_file:
         data = json.load(info_file)
     for brick in data["bricks"]:
@@ -958,14 +967,6 @@ def mount_glusterfs(volume, mountpoint, is_client=False):
         err = "Cannot establish a socket connection with any server pod"
         cmd = "sock.connect(hosts, 24007)"
         raise CommandException(-1, cmd, err)
-
-    # Ignore if already glusterfs process running for that volume
-    if is_gluster_mount_proc_running(volname, mountpoint):
-        logging.debug(logf(
-            "Already mounted",
-            mount=mountpoint
-        ))
-        return mountpoint
 
     if not os.path.exists(mountpoint):
         makedirs(mountpoint)

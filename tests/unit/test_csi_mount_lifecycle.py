@@ -147,6 +147,33 @@ def test_native_mount_rechecks_process_while_holding_lock(monkeypatch, tmp_path)
     assert checks == [False, True]
 
 
+def test_existing_native_mount_does_not_require_reachable_server(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    volume = _native_volume(tmp_path, volumeutils)
+    mountpoint = str(tmp_path / "mount")
+
+    monkeypatch.setattr(
+        volumeutils,
+        "is_gluster_mount_proc_running",
+        lambda volname, path: (
+            volname == volume["name"] and path == mountpoint
+        ),
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "is_server_pod_reachable",
+        lambda *_args: pytest.fail("reachability checked for existing mount"),
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "execute",
+        lambda *_args: pytest.fail("existing mount launched again"),
+    )
+
+    assert volumeutils.mount_glusterfs(volume, mountpoint) == mountpoint
+
+
 def test_external_mount_rechecks_process_while_holding_lock(monkeypatch):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     volume = _external_volume()
