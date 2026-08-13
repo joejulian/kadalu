@@ -1,10 +1,12 @@
 """
 controller server implementation
 """
+import functools
 import json
 import logging
 import os
 import random
+import threading
 import time
 
 import csi_pb2
@@ -16,7 +18,8 @@ from kadalulib import (PV_TYPE_RAWBLOCK, PV_TYPE_SUBVOL, PV_TYPE_VIRTBLOCK,
 from volumeutils import (HOSTVOL_MOUNTDIR, check_external_volume,
                          create_block_volume, create_subdir_volume,
                          delete_volume,
-                         get_pv_hosting_volumes, is_hosting_volume_free,
+                         get_accounted_pv_size, get_pv_hosting_volumes,
+                         is_hosting_volume_free,
                          mount_and_select_hosting_volume, search_volume,
                          save_pv_metadata,
                          unmount_glusterfs,
@@ -33,6 +36,21 @@ GEN = None
 # Rate limiting number of PVCs returned per request of ListVolumes if CO
 # doesn't mention any max_entries
 LIMIT = 30
+
+# Create, expand, and delete each perform filesystem work between checking and
+# updating stat.db. Keep those operations in one process-wide critical section
+# so concurrent CSI requests cannot consume the same free capacity.
+CAPACITY_OPERATION_LOCK = threading.Lock()
+
+
+def serialized_capacity_operation(method):
+    """Serialize controller operations which change pool capacity."""
+    @functools.wraps(method)
+    def locked_method(*args, **kwargs):
+        with CAPACITY_OPERATION_LOCK:
+            return method(*args, **kwargs)
+
+    return locked_method
 
 
 # noqa # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -153,6 +171,62 @@ def existing_volume_is_compatible(volume, request, pvtype):
     )
 
 
+def apply_subdir_quota(volume, size, context, update_metadata):
+    """Apply a subvolume quota, optionally committing its new metadata."""
+    mntdir = os.path.join(HOSTVOL_MOUNTDIR, volume.hostvol)
+    use_gluster_quota = (
+        volume.extra['hostvoltype'] == "External"
+        and os.path.isfile("/etc/secret-volume/ssh-privatekey")
+        and "SECRET_GLUSTERQUOTA_SSH_USERNAME" in os.environ
+    )
+
+    if not use_gluster_quota:
+        update_subdir_volume(
+            mntdir,
+            volume.extra['hostvoltype'],
+            volume.volname,
+            size,
+            update_metadata=update_metadata,
+        )
+        return True
+
+    errmsg = execute_gluster_quota_command(
+        "/etc/secret-volume/ssh-privatekey",
+        os.environ.get('SECRET_GLUSTERQUOTA_SSH_USERNAME'),
+        volume.extra['ghost'],
+        volume.extra['gvolname'],
+        volume.volpath,
+        size,
+    )
+    if errmsg:
+        context.set_details(errmsg)
+        context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+        return False
+
+    if update_metadata:
+        update_pv_metadata(mntdir, volume.volpath, size)
+
+    return True
+
+
+def capacity_reservation_available(hostvol, pvname, desired_size, context):
+    """Check capacity needed to reconcile an absolute stat.db record."""
+    accounted_size = get_accounted_pv_size(hostvol, pvname)
+    additional_reservation = max(desired_size - accounted_size, 0)
+    if (
+            additional_reservation
+            and not is_hosting_volume_free(
+                hostvol,
+                additional_reservation,
+            )):
+        errmsg = "Host volume resource is exhausted"
+        context.set_details(errmsg)
+        context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
+        return False
+
+    return True
+
+
 class ControllerServer(csi_pb2_grpc.ControllerServicer):
     """
     ControllerServer object is responsible for handling host
@@ -161,6 +235,7 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
     """
 
     # noqa # pylint: disable=too-many-locals,too-many-statements,too-many-branches
+    @serialized_capacity_operation
     def CreateVolume(self, request, context):
         start_time = time.time()
         logging.debug(logf(
@@ -222,9 +297,13 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 # while updating stat.db. Reconcile the absolute-size record
                 # on retries; update_pv_record uses INSERT OR REPLACE, so this
                 # repairs interrupted creates without adding the size twice.
-                if (
-                        volume.extra['hostvoltype'] == "External"
-                        and not volume.single_pv_per_pool):
+                if not volume.single_pv_per_pool:
+                    if not capacity_reservation_available(
+                            volume.hostvol,
+                            volume.volname,
+                            volume.size,
+                            context):
+                        return csi_pb2.CreateVolumeResponse()
                     update_free_size(
                         volume.hostvol,
                         volume.volname,
@@ -495,7 +574,7 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
                 }
             })
 
-
+    @serialized_capacity_operation
     def DeleteVolume(self, request, context):
         start_time = time.time()
 
@@ -661,6 +740,7 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             ]
         )
 
+    @serialized_capacity_operation
     def ControllerExpandVolume(self, request, context):
         """
         Controller plugin RPC call implementation of EXPAND_VOLUME
@@ -711,11 +791,46 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
         pvname = existing_volume.volname
 
         # Expansion is idempotent and must never shrink an existing volume.
+        # A stale smaller request still reconciles the existing absolute size,
+        # repairing any interrupted quota or accounting update without using
+        # the stale requested size.
         if expansion_requested_pvsize <= existing_pvsize:
+            # Metadata is committed only after quota, but the process can still
+            # fail before stat.db is updated. Reapplying an absolute quota and
+            # accounting record makes a retry repair either legacy
+            # ordering or that interrupted final step.
+            if (
+                    not existing_volume.single_pv_per_pool
+                    and existing_volume.voltype == PV_TYPE_SUBVOL):
+                if not capacity_reservation_available(
+                    existing_volume.hostvol,
+                    pvname,
+                    existing_pvsize,
+                    context,
+                ):
+                    return csi_pb2.ControllerExpandVolumeResponse(
+                        capacity_bytes=int(existing_pvsize),
+                        node_expansion_required=False,
+                    )
+
+                if not apply_subdir_quota(
+                        existing_volume,
+                        existing_pvsize,
+                        context,
+                        update_metadata=False):
+                    return csi_pb2.ControllerExpandVolumeResponse(
+                        capacity_bytes=int(existing_pvsize),
+                        node_expansion_required=False,
+                    )
+                update_free_size(
+                    existing_volume.hostvol,
+                    pvname,
+                    -existing_pvsize,
+                )
+
             logging.info(logf(
-                "Volume already satisfies requested capacity",
-                existing_pvsize=existing_pvsize,
-                expansion_requested_pvsize=expansion_requested_pvsize,
+                "Reconciled volume at requested capacity",
+                size=existing_pvsize,
                 volume=pvname,
             ))
             return csi_pb2.ControllerExpandVolumeResponse(
@@ -765,60 +880,32 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
         ))
 
         hostvol = existing_volume.hostvol
-        mntdir = os.path.join(HOSTVOL_MOUNTDIR, hostvol)
-        use_gluster_quota = False
 
-        # Check free-size in storage-pool before expansion
-        if not is_hosting_volume_free(hostvol, additional_pvsize_required):
+        # Check free size against the absolute accounting record. This also
+        # repairs old volumes whose metadata exists but stat.db entry does not.
+        if not capacity_reservation_available(
+                hostvol,
+                pvname,
+                expansion_requested_pvsize,
+                context):
 
             logging.error(logf(
                 "Hosting volume is full. Add more storage",
                 volume=hostvol
             ))
-            errmsg = "Host volume resource is exhausted"
-            context.set_details(errmsg)
-            context.set_code(grpc.StatusCode.RESOURCE_EXHAUSTED)
             return csi_pb2.ControllerExpandVolumeResponse(
                 capacity_bytes=int(existing_pvsize),
                 node_expansion_required=False,
             )
 
-        hostvoltype = existing_volume.extra['hostvoltype']
-
-        if hostvoltype == 'External':
-            # Use Gluster quota if set
-            if (os.path.isfile("/etc/secret-volume/ssh-privatekey") \
-                and "SECRET_GLUSTERQUOTA_SSH_USERNAME" in os.environ):
-                use_gluster_quota = True
-
-        # Can be true only if its 'External'
-        if use_gluster_quota:
-            secret_private_key = "/etc/secret-volume/ssh-privatekey"
-            secret_username = os.environ.get('SECRET_GLUSTERQUOTA_SSH_USERNAME', None)
-
-            logging.debug(logf("Set Quota (expand) using gluster directory Quota"))
-            errmsg = execute_gluster_quota_command(
-                secret_private_key, secret_username, existing_volume.extra['ghost'],
-                existing_volume.extra['gvolname'], existing_volume.volpath,
-                expansion_requested_pvsize)
-            if errmsg:
-                context.set_details(errmsg)
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                return csi_pb2.ControllerExpandVolumeResponse(
-                    capacity_bytes=int(existing_pvsize),
-                    node_expansion_required=False,
-                )
-            update_pv_metadata(
-                mntdir,
-                existing_volume.volpath,
+        if not apply_subdir_quota(
+                existing_volume,
                 expansion_requested_pvsize,
-            )
-        else:
-            update_subdir_volume(
-                mntdir,
-                hostvoltype,
-                pvname,
-                expansion_requested_pvsize,
+                context,
+                update_metadata=True):
+            return csi_pb2.ControllerExpandVolumeResponse(
+                capacity_bytes=int(existing_pvsize),
+                node_expansion_required=False,
             )
 
         logging.info(logf(

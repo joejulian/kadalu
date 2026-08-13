@@ -3,7 +3,11 @@
 import importlib
 import os
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -85,11 +89,23 @@ def test_expand_retry_never_shrinks_an_existing_volume(monkeypatch):
     monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
     monkeypatch.setattr(
         controllerserver,
-        "is_hosting_volume_free",
-        _fail_if_called,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
     )
-    monkeypatch.setattr(controllerserver, "update_subdir_volume", _fail_if_called)
-    monkeypatch.setattr(controllerserver, "update_free_size", _fail_if_called)
+    monkeypatch.setattr(controllerserver, "is_hosting_volume_free", _fail_if_called)
+    quota_updates = []
+    monkeypatch.setattr(
+        controllerserver,
+        "update_subdir_volume",
+        lambda _mount, _hostvoltype, _pvname, size, update_metadata=True:
+            quota_updates.append((size, update_metadata)),
+    )
+    accounting_updates = []
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        lambda *args: accounting_updates.append(args),
+    )
 
     context = FakeContext()
     response = controllerserver.ControllerServer().ControllerExpandVolume(
@@ -103,10 +119,16 @@ def test_expand_retry_never_shrinks_an_existing_volume(monkeypatch):
     assert isinstance(response, csi_pb2.ControllerExpandVolumeResponse)
     assert response.capacity_bytes == existing.size
     assert response.node_expansion_required is False
+    assert quota_updates == [(existing.size, False)]
+    assert accounting_updates == [(
+        existing.hostvol,
+        existing.volname,
+        -existing.size,
+    )]
     assert context.code is None
 
 
-def test_create_retry_returns_the_original_volume_without_mutating(monkeypatch):
+def test_native_create_retry_repairs_capacity_accounting(monkeypatch):
     volumeutils = _load_csi_module(monkeypatch, "volumeutils")
     controllerserver = _load_csi_module(monkeypatch, "controllerserver")
     csi_pb2 = importlib.import_module("csi_pb2")
@@ -123,7 +145,18 @@ def test_create_retry_returns_the_original_volume_without_mutating(monkeypatch):
         "mount_and_select_hosting_volume",
         _fail_if_called,
     )
-    monkeypatch.setattr(controllerserver, "update_free_size", _fail_if_called)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
+    )
+    monkeypatch.setattr(controllerserver, "is_hosting_volume_free", _fail_if_called)
+    accounting_updates = []
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        lambda *args: accounting_updates.append(args),
+    )
 
     context = FakeContext()
     response = controllerserver.ControllerServer().CreateVolume(
@@ -152,7 +185,53 @@ def test_create_retry_returns_the_original_volume_without_mutating(monkeypatch):
         "fstype": "xfs",
         "single_pv_per_pool": "False",
     }
+    assert accounting_updates == [(
+        existing.hostvol,
+        existing.volname,
+        -existing.size,
+    )]
     assert context.code is None
+
+
+def test_create_retry_rejects_missing_reservation_when_pool_is_full(
+        monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    existing = _existing_volume(volumeutils)
+
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: 0,
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "is_hosting_volume_free",
+        lambda _hostvol, size: size != existing.size,
+    )
+    monkeypatch.setattr(controllerserver, "update_free_size", _fail_if_called)
+
+    context = FakeContext()
+    response = controllerserver.ControllerServer().CreateVolume(
+        csi_pb2.CreateVolumeRequest(
+            name=existing.volname,
+            capacity_range={"required_bytes": existing.size},
+            volume_capabilities=[{
+                "mount": {},
+                "access_mode": {"mode": "MULTI_NODE_MULTI_WRITER"},
+            }],
+            parameters={
+                "storage_name": existing.hostvol,
+                "single_pv_per_pool": "false",
+            },
+        ),
+        context,
+    )
+
+    assert not response.HasField("volume")
+    assert context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
 
 
 def test_create_retry_rejects_incompatible_pool(monkeypatch):
@@ -217,6 +296,59 @@ def test_external_create_retry_rejects_different_gluster_target(monkeypatch):
     assert isinstance(response, csi_pb2.CreateVolumeResponse)
     assert not response.HasField("volume")
     assert context.code == grpc.StatusCode.ALREADY_EXISTS
+
+
+def test_external_create_retry_repairs_capacity_accounting(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    existing = _existing_volume(volumeutils)
+    existing.extra.update({
+        "hostvoltype": "External",
+        "ghost": "bellagio.example.invalid",
+        "gvolname": "bellagio-vault",
+        "goptions": "log-level=WARNING",
+    })
+    accounting_updates = []
+
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
+    )
+    monkeypatch.setattr(controllerserver, "is_hosting_volume_free", _fail_if_called)
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        lambda *args: accounting_updates.append(args),
+    )
+
+    response = controllerserver.ControllerServer().CreateVolume(
+        csi_pb2.CreateVolumeRequest(
+            name=existing.volname,
+            capacity_range={"required_bytes": existing.size},
+            volume_capabilities=[{
+                "mount": {},
+                "access_mode": {"mode": "MULTI_NODE_MULTI_WRITER"},
+            }],
+            parameters={
+                "hostvol_type": "External",
+                "gluster_hosts": "bellagio.example.invalid",
+                "gluster_volname": "bellagio-vault",
+                "gluster_options": "log-level=WARNING",
+                "single_pv_per_pool": "false",
+            },
+        ),
+        FakeContext(),
+    )
+
+    assert response.volume.volume_id == existing.volname
+    assert accounting_updates == [(
+        existing.hostvol,
+        existing.volname,
+        -existing.size,
+    )]
 
 
 def test_external_kadalu_retry_repairs_interrupted_capacity_accounting(
@@ -301,6 +433,11 @@ def test_external_kadalu_retry_repairs_interrupted_capacity_accounting(
     )
     monkeypatch.setattr(
         controllerserver,
+        "get_accounted_pv_size",
+        lambda hostvol, pvname: accounted_sizes.get((hostvol, pvname), 0),
+    )
+    monkeypatch.setattr(
+        controllerserver,
         "send_analytics_tracker",
         lambda *_args: None,
     )
@@ -360,9 +497,326 @@ def test_capacity_reconciliation_replaces_the_existing_pv_record(
     with volumeutils.SizeAccounting(hostvol, str(mountdir)) as accounting:
         accounting.update_summary(10 * pvsize)
         stats = accounting.get_stats()
+        recorded_size = accounting.get_pv_size(pvname)
+        missing_size = accounting.get_pv_size("pvc-basher-tarr")
 
     assert stats["number_of_pvs"] == 1
     assert stats["used_size_bytes"] == pvsize
+    assert recorded_size == pvsize
+    assert missing_size == 0
+
+
+def test_external_simple_quota_is_applied_before_expansion_metadata(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    pvname = "pvc-bellagio-vault"
+    expanded_size = 30 * 1024 * 1024
+    events = []
+
+    monkeypatch.setattr(
+        volumeutils.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_blocks=expanded_size,
+            f_bsize=1,
+        ),
+    )
+    monkeypatch.setattr(
+        volumeutils.os,
+        "setxattr",
+        lambda _path, name, value: events.append(("quota", name, value)),
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "update_pv_metadata",
+        lambda _mount, _path, size: events.append(("metadata", size)),
+    )
+
+    volume = volumeutils.update_subdir_volume(
+        str(tmp_path),
+        "External",
+        pvname,
+        expanded_size,
+    )
+
+    assert volume.size == expanded_size
+    assert events == [
+        (
+            "quota",
+            "trusted.gfs.squota.limit",
+            str(expanded_size).encode(),
+        ),
+        ("metadata", expanded_size),
+    ]
+
+
+def test_simple_quota_is_applied_before_create_metadata(monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    pvsize = 20 * 1024 * 1024
+    events = []
+
+    monkeypatch.setattr(
+        volumeutils.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(f_blocks=pvsize, f_bsize=1),
+    )
+    monkeypatch.setattr(
+        volumeutils.os,
+        "setxattr",
+        lambda _path, name, value: events.append(("quota", name, value)),
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "save_pv_metadata",
+        lambda _mount, _path, size: events.append(("metadata", size)),
+    )
+
+    volumeutils.create_subdir_volume(
+        str(tmp_path),
+        "pvc-bellagio-vault",
+        pvsize,
+        use_gluster_quota=False,
+    )
+
+    assert events == [
+        ("quota", "trusted.glusterfs.namespace", b"true"),
+        ("quota", "trusted.gfs.squota.limit", str(pvsize).encode()),
+        ("metadata", pvsize),
+    ]
+
+
+def test_failed_simple_quota_does_not_commit_expansion_metadata(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    expanded_size = 30 * 1024 * 1024
+
+    monkeypatch.setattr(
+        volumeutils.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_blocks=expanded_size,
+            f_bsize=1,
+        ),
+    )
+
+    def fail_quota(*_args):
+        raise OSError("the Bellagio vault rejected the new limit")
+
+    monkeypatch.setattr(volumeutils.os, "setxattr", fail_quota)
+    monkeypatch.setattr(volumeutils, "update_pv_metadata", _fail_if_called)
+
+    with pytest.raises(OSError):
+        volumeutils.update_subdir_volume(
+            str(tmp_path),
+            "Replica1",
+            "pvc-bellagio-vault",
+            expanded_size,
+        )
+
+
+def test_equal_size_expand_retry_repairs_quota_and_accounting(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    existing = _existing_volume(volumeutils)
+    expanded_size = 30 * 1024 * 1024
+    quota_updates = []
+    accounting_attempts = 0
+
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: expanded_size,
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "is_hosting_volume_free",
+        lambda _hostvol, _size: True,
+    )
+
+    def fake_update_subdir(
+            _mount, _hostvoltype, _pvname, size, update_metadata=True):
+        quota_updates.append((size, update_metadata))
+        if update_metadata:
+            existing.size = size
+
+    monkeypatch.setattr(
+        controllerserver,
+        "update_subdir_volume",
+        fake_update_subdir,
+    )
+
+    def fake_update_free_size(_hostvol, _pvname, _sizechange):
+        nonlocal accounting_attempts
+        accounting_attempts += 1
+        if accounting_attempts == 1:
+            raise OSError("the casino ledger is temporarily unavailable")
+
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        fake_update_free_size,
+    )
+
+    request = csi_pb2.ControllerExpandVolumeRequest(
+        volume_id=existing.volname,
+        capacity_range={"required_bytes": expanded_size},
+    )
+
+    with pytest.raises(OSError):
+        controllerserver.ControllerServer().ControllerExpandVolume(
+            request,
+            FakeContext(),
+        )
+
+    response = controllerserver.ControllerServer().ControllerExpandVolume(
+        request,
+        FakeContext(),
+    )
+
+    assert response.capacity_bytes == expanded_size
+    assert quota_updates == [
+        (expanded_size, True),
+        (expanded_size, False),
+    ]
+    assert accounting_attempts == 2
+
+
+def test_equal_size_repair_rejects_missing_reservation_when_pool_is_full(
+        monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    existing = _existing_volume(volumeutils)
+    capacity_checks = []
+
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: 0,
+    )
+
+    def fake_is_free(_hostvol, size):
+        capacity_checks.append(size)
+        return False
+
+    monkeypatch.setattr(controllerserver, "is_hosting_volume_free", fake_is_free)
+    monkeypatch.setattr(controllerserver, "apply_subdir_quota", _fail_if_called)
+    monkeypatch.setattr(controllerserver, "update_free_size", _fail_if_called)
+
+    context = FakeContext()
+    response = controllerserver.ControllerServer().ControllerExpandVolume(
+        csi_pb2.ControllerExpandVolumeRequest(
+            volume_id=existing.volname,
+            capacity_range={"required_bytes": existing.size},
+        ),
+        context,
+    )
+
+    assert response.capacity_bytes == existing.size
+    assert context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert capacity_checks == [existing.size]
+
+
+def test_equal_size_repair_checks_only_unaccounted_delta(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    existing = _existing_volume(volumeutils)
+    accounted_size = 8 * 1024 * 1024
+    capacity_checks = []
+
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: accounted_size,
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "is_hosting_volume_free",
+        lambda _hostvol, size: capacity_checks.append(size) or True,
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "apply_subdir_quota",
+        lambda *_args, **_kwargs: True,
+    )
+    accounting_updates = []
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        lambda *args: accounting_updates.append(args),
+    )
+
+    response = controllerserver.ControllerServer().ControllerExpandVolume(
+        csi_pb2.ControllerExpandVolumeRequest(
+            volume_id=existing.volname,
+            capacity_range={"required_bytes": existing.size},
+        ),
+        FakeContext(),
+    )
+
+    assert response.capacity_bytes == existing.size
+    assert capacity_checks == [existing.size - accounted_size]
+    assert accounting_updates == [(
+        existing.hostvol,
+        existing.volname,
+        -existing.size,
+    )]
+
+
+def test_equal_size_external_ssh_retry_reapplies_remote_quota(monkeypatch):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    existing = _existing_volume(volumeutils)
+    existing.extra.update({
+        "hostvoltype": "External",
+        "ghost": "bellagio.example.invalid",
+        "gvolname": "bellagio-vault",
+    })
+    quota_calls = []
+
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
+    )
+    monkeypatch.setattr(controllerserver, "is_hosting_volume_free", _fail_if_called)
+    monkeypatch.setattr(controllerserver.os.path, "isfile", lambda _path: True)
+    monkeypatch.setenv("SECRET_GLUSTERQUOTA_SSH_USERNAME", "danny-ocean")
+    monkeypatch.setattr(
+        controllerserver,
+        "execute_gluster_quota_command",
+        lambda *args: quota_calls.append(args),
+    )
+    monkeypatch.setattr(controllerserver, "update_pv_metadata", _fail_if_called)
+    accounting_updates = []
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        lambda *args: accounting_updates.append(args),
+    )
+
+    response = controllerserver.ControllerServer().ControllerExpandVolume(
+        csi_pb2.ControllerExpandVolumeRequest(
+            volume_id=existing.volname,
+            capacity_range={"required_bytes": existing.size},
+        ),
+        FakeContext(),
+    )
+
+    assert response.capacity_bytes == existing.size
+    assert quota_calls[0][-1] == existing.size
+    assert accounting_updates == [(
+        existing.hostvol,
+        existing.volname,
+        -existing.size,
+    )]
 
 
 def test_expand_full_pool_returns_the_correct_response_type(monkeypatch):
@@ -372,6 +826,11 @@ def test_expand_full_pool_returns_the_correct_response_type(monkeypatch):
     existing = _existing_volume(volumeutils)
 
     monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
+    )
     monkeypatch.setattr(
         controllerserver,
         "is_hosting_volume_free",
@@ -400,6 +859,11 @@ def test_single_pv_pool_rejects_expansion(monkeypatch):
     existing = _existing_volume(volumeutils, single_pv_per_pool=True)
 
     monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
+    )
     monkeypatch.setattr(
         controllerserver,
         "is_hosting_volume_free",
@@ -463,6 +927,11 @@ def test_failed_external_quota_expansion_does_not_commit_metadata(monkeypatch):
     monkeypatch.setattr(controllerserver, "search_volume", lambda _name: existing)
     monkeypatch.setattr(
         controllerserver,
+        "get_accounted_pv_size",
+        lambda _hostvol, _pvname: existing.size,
+    )
+    monkeypatch.setattr(
+        controllerserver,
         "is_hosting_volume_free",
         lambda _hostvol, _size: True,
     )
@@ -487,6 +956,140 @@ def test_failed_external_quota_expansion_does_not_commit_metadata(monkeypatch):
 
     assert response.capacity_bytes == existing.size
     assert context.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_concurrent_external_creates_cannot_overcommit_capacity(
+        monkeypatch, tmp_path):
+    volumeutils = _load_csi_module(monkeypatch, "volumeutils")
+    controllerserver = _load_csi_module(monkeypatch, "controllerserver")
+    csi_pb2 = importlib.import_module("csi_pb2")
+    pool_capacity = 100
+    requested_size = 60
+    used_capacity = 0
+    active_checks = 0
+    maximum_active_checks = 0
+    volumes = {}
+    state_lock = threading.Lock()
+    start_barrier = threading.Barrier(2)
+
+    monkeypatch.setattr(controllerserver, "VOLINFO_DIR", str(tmp_path))
+    (tmp_path / "uid").write_text("the-bellagio-crew", encoding="utf-8")
+    monkeypatch.setattr(
+        controllerserver,
+        "search_volume",
+        lambda name: volumes.get(name),
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "get_pv_hosting_volumes",
+        lambda _filters: [{
+            "name": "bellagio-pool",
+            "type": "External",
+            "g_volname": "bellagio-vault",
+            "g_host": "bellagio.example.invalid",
+            "g_options": "",
+        }],
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "check_external_volume",
+        lambda _request, volumes_found: volumes_found[0],
+    )
+    monkeypatch.setattr(controllerserver.os.path, "isfile", lambda _path: False)
+    monkeypatch.setattr(
+        controllerserver,
+        "send_analytics_tracker",
+        lambda *_args: None,
+    )
+
+    def fake_is_free(_hostvol, size):
+        nonlocal active_checks, maximum_active_checks
+        with state_lock:
+            active_checks += 1
+            maximum_active_checks = max(maximum_active_checks, active_checks)
+            available = used_capacity + size <= pool_capacity
+        time.sleep(0.05)
+        with state_lock:
+            active_checks -= 1
+        return available
+
+    monkeypatch.setattr(
+        controllerserver,
+        "is_hosting_volume_free",
+        fake_is_free,
+    )
+
+    def fake_create_subdir(_mount, name, size, _use_quota, **_kwargs):
+        volume = volumeutils.Volume(
+            volname=name,
+            voltype=volumeutils.PV_TYPE_SUBVOL,
+            volhash=volumeutils.get_volname_hash(name),
+            hostvol="bellagio-pool",
+            size=size,
+            hostvoltype="External",
+            ghost="bellagio.example.invalid",
+            gvolname="bellagio-vault",
+        )
+        volumes[name] = volume
+        return volume
+
+    monkeypatch.setattr(
+        controllerserver,
+        "create_subdir_volume",
+        fake_create_subdir,
+    )
+
+    def fake_update_free_size(_hostvol, _pvname, sizechange):
+        nonlocal used_capacity
+        with state_lock:
+            used_capacity = used_capacity - sizechange
+
+    monkeypatch.setattr(
+        controllerserver,
+        "update_free_size",
+        fake_update_free_size,
+    )
+
+    def request(name):
+        return csi_pb2.CreateVolumeRequest(
+            name=name,
+            capacity_range={"required_bytes": requested_size},
+            volume_capabilities=[{
+                "mount": {},
+                "access_mode": {"mode": "MULTI_NODE_MULTI_WRITER"},
+            }],
+            parameters={
+                "hostvol_type": "External",
+                "gluster_hosts": "bellagio.example.invalid",
+                "gluster_volname": "bellagio-vault",
+                "single_pv_per_pool": "false",
+            },
+        )
+
+    def create(name):
+        context = FakeContext()
+        start_barrier.wait()
+        response = controllerserver.ControllerServer().CreateVolume(
+            request(name),
+            context,
+        )
+        return response, context
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            create,
+            ("pvc-danny-ocean", "pvc-rusty-ryan"),
+        ))
+
+    successful = [response for response, _context in results
+                  if response.HasField("volume")]
+    rejected = [context for response, context in results
+                if not response.HasField("volume")]
+    assert len(successful) == 1
+    assert len(rejected) == 1
+    assert rejected[0].code == grpc.StatusCode.RESOURCE_EXHAUSTED
+    assert used_capacity == requested_size
+    assert maximum_active_checks == 1
 
 
 @pytest.mark.parametrize("hostvol", [

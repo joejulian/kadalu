@@ -219,6 +219,15 @@ def update_free_size(hostvol, pvname, sizechange):
                 acc.update_pv_record(pvname, -sizechange)
 
 
+def get_accounted_pv_size(hostvol, pvname):
+    """Return the absolute size currently reserved for a PV in stat.db."""
+    mntdir = os.path.join(HOSTVOL_MOUNTDIR, hostvol)
+    retry_errors(os.statvfs, [mntdir], [ENOTCONN])
+    with statfile_lock:
+        with SizeAccounting(hostvol, mntdir) as acc:
+            return acc.get_pv_size(pvname)
+
+
 def mount_and_select_hosting_volume(pv_hosting_volumes, required_size):
     """Mount each hosting volume to find available space"""
     for volume in pv_hosting_volumes:
@@ -329,6 +338,68 @@ def save_pv_metadata(hostvol_mnt, pvpath, pvsize):
         ))
 
 
+def _wait_for_simple_quota(hostvol_mnt, volpath, size, operation):
+    """Wait until statvfs exposes the requested simple-quota size."""
+    pvsize_buffer = size * 0.05  # 5%
+    pvsize_min = size - pvsize_buffer
+    pvsize_max = size + pvsize_buffer
+    logging.debug(logf(
+        "Watching df of pv directory",
+        pvdir=volpath,
+        pvsize_buffer=pvsize_buffer,
+    ))
+
+    volpath_full = os.path.join(hostvol_mnt, volpath)
+    for count in range(1, 7):
+        pvstat = retry_errors(os.statvfs, [volpath_full], [ENOTCONN])
+        volsize = pvstat.f_blocks * pvstat.f_bsize
+        if pvsize_min < volsize < pvsize_max:
+            logging.debug(logf(
+                "Quota set successfully",
+                operation=operation,
+                volsize=volsize,
+                pvsize=size,
+                num_tries=count,
+            ))
+            return
+
+        if count < 6:
+            time.sleep(1)
+
+    raise TimeoutError(
+        "Simple quota %s did not expose requested size %s for %s; got %s"
+        % (operation, size, volpath, volsize)
+    )
+
+
+def _set_simple_quota(
+        hostvol_mnt, volpath, size, initialize_namespace=False):
+    """Apply and verify the simple-quota xattrs for a subvolume."""
+    volpath_full = os.path.join(hostvol_mnt, volpath)
+    if initialize_namespace:
+        retry_errors(
+            os.setxattr,
+            [
+                volpath_full,
+                "trusted.glusterfs.namespace",
+                b"true",
+            ],
+            [ENOTCONN],
+        )
+
+    retry_errors(
+        os.setxattr,
+        [
+            volpath_full,
+            "trusted.gfs.squota.limit",
+            str(size).encode(),
+        ],
+        [ENOTCONN],
+    )
+    operation = "creation" if initialize_namespace else "expansion"
+    _wait_for_simple_quota(hostvol_mnt, volpath, size, operation)
+
+
 def create_subdir_volume(
         hostvol_mnt, volname, size, use_gluster_quota,
         save_metadata=True):
@@ -350,12 +421,8 @@ def create_subdir_volume(
         pvdir=volpath
     ))
 
-    # Write info file so that Brick's quotad sidecar
-    # container picks it up (or) for external quota expansion
-    if save_metadata:
-        save_pv_metadata(hostvol_mnt, volpath, size)
-
     if use_gluster_quota is True:
+        # The caller must apply the remote quota and only then persist metadata.
         return Volume(
             volname=volname,
             voltype=PV_TYPE_SUBVOL,
@@ -365,59 +432,16 @@ def create_subdir_volume(
             volpath=volpath,
         )
 
-    # Wait for quota set
-    # TODO: Handle Timeout
-    pvsize_buffer = size * 0.05  # 5%
-    pvsize_min = size - pvsize_buffer
-    pvsize_max = size + pvsize_buffer
-    logging.debug(logf(
-        "Watching df of pv directory",
-        pvdir=volpath,
-        pvsize_buffer=pvsize_buffer,
-    ))
-
-    #setfattr -n trusted.glusterfs.namespace -v true
-    #setfattr -n trusted.gfs.squota.limit -v size
-    try:
-        retry_errors(os.setxattr,
-                     [os.path.join(hostvol_mnt, volpath),
-                      "trusted.glusterfs.namespace",
-                      "true".encode()],
-                     [ENOTCONN])
-        retry_errors(os.setxattr,
-                     [os.path.join(hostvol_mnt, volpath),
-                      "trusted.gfs.squota.limit",
-                      str(size).encode()],
-                     [ENOTCONN])
-    # noqa # pylint: disable=broad-except
-    except Exception as err:
-        logging.info(logf(
-            "Failed to set quota using simple-quota. Continuing",
-            error=err
-        ))
-
-    count = 0
-    while True:
-        count += 1
-        pvstat = retry_errors(os.statvfs, [os.path.join(hostvol_mnt, volpath)], [ENOTCONN])
-        volsize = pvstat.f_blocks * pvstat.f_bsize
-        if pvsize_min < volsize < pvsize_max:
-            logging.debug(logf(
-                "Matching df output, Quota set successful",
-                volsize=volsize,
-                num_tries=count
-            ))
-            break
-
-        if count >= 6:
-            logging.warning(logf(
-                "Waited for some time, Quota set failed, continuing.",
-                volsize=volsize,
-                num_tries=count
-            ))
-            break
-
-        time.sleep(1)
+    # Quota must be observable before metadata makes the volume discoverable.
+    # If quota application or verification fails, a retry can safely repeat it.
+    _set_simple_quota(
+        hostvol_mnt,
+        volpath,
+        size,
+        initialize_namespace=True,
+    )
+    if save_metadata:
+        save_pv_metadata(hostvol_mnt, volpath, size)
 
     return Volume(
         volname=volname,
@@ -461,7 +485,7 @@ def is_hosting_volume_free(hostvol, requested_pvsize):
 
 
 def update_subdir_volume(
-        hostvol_mnt, hostvoltype, volname, expansion_requested_pvsize,
+        hostvol_mnt, _hostvoltype, volname, expansion_requested_pvsize,
         update_metadata=True):
     """Update sub directory Volume"""
 
@@ -482,56 +506,19 @@ def update_subdir_volume(
         pvdir=volpath
     ))
 
-    # Write info file so that Brick's quotad sidecar
-    # container picks it up.
+    # External Kadalu-format pools without SSH credentials use the same
+    # simple-quota interface as native pools.
+    _set_simple_quota(
+        hostvol_mnt,
+        volpath,
+        expansion_requested_pvsize,
+    )
     if update_metadata:
-        update_pv_metadata(hostvol_mnt, volpath, expansion_requested_pvsize)
-
-    # Wait for quota set
-    # TODO: Handle Timeout
-    pvsize_buffer = expansion_requested_pvsize * 0.05  # 5%
-    pvsize_min = expansion_requested_pvsize - pvsize_buffer
-    pvsize_max = expansion_requested_pvsize + pvsize_buffer
-    logging.debug(logf(
-        "Watching df of pv directory",
-        pvdir=volpath,
-        pvsize_buffer=pvsize_buffer,
-    ))
-
-    # Handle this case in calling function
-    if hostvoltype == 'External':
-        return None
-
-    retry_errors(os.setxattr,
-                 [os.path.join(hostvol_mnt, volpath),
-                  "trusted.gfs.squota.limit",
-                  str(expansion_requested_pvsize).encode()],
-                 [ENOTCONN])
-
-    count = 0
-    while True:
-        count += 1
-        pvstat = retry_errors(os.statvfs, [os.path.join(hostvol_mnt, volpath)], [ENOTCONN])
-        volsize = pvstat.f_blocks * pvstat.f_bsize
-        if pvsize_min < volsize < pvsize_max:
-            logging.debug(logf(
-                "Matching df output, Quota update set successful",
-                volsize=volsize,
-                pvsize=expansion_requested_pvsize,
-                num_tries=count
-            ))
-            break
-
-        if count >= 6:
-            logging.warning(logf(
-                "Waited for some time, Quota update set failed, continuing.",
-                volsize=volsize,
-                pvsize=expansion_requested_pvsize,
-                num_tries=count
-            ))
-            break
-
-        time.sleep(1)
+        update_pv_metadata(
+            hostvol_mnt,
+            volpath,
+            expansion_requested_pvsize,
+        )
 
     return Volume(
         volname=volname,

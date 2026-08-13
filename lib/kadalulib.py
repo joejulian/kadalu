@@ -417,6 +417,15 @@ class SizeAccounting:
         self.cursor.execute("DELETE FROM pv_stats WHERE pvname = ?", (pvname, ))
         self.conn.commit()
 
+    def get_pv_size(self, pvname):
+        """Return the absolute size reserved for a PV, or zero if absent."""
+        self.cursor.execute(
+            "SELECT size FROM pv_stats WHERE pvname = ?",
+            (pvname,),
+        )
+        record = self.cursor.fetchone()
+        return record[0] if record is not None else 0
+
     def get_stats(self):
         """Get Statistics: total/used/free size, number of pvs"""
         self.cursor.execute("SELECT COUNT(pvname), SUM(size) FROM pv_stats")
