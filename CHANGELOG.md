@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Helm, Operator: Configure the BusyBox logging helper independently from the
+  Kadalu application image registry. Private-registry deployments must now set
+  `global.busyboxImage` explicitly.
 - Server: Use Kadalu Volgen library for volfile generation
 - CSI: Fetch volfiles from brick processes in server using --volfile-server &
   remove storage options from mount flow.

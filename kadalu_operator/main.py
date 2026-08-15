@@ -30,6 +30,11 @@ IMAGES_HUB = os.environ.get("IMAGES_HUB", "ghcr.io")
 CSI_SIDECAR_REGISTRY = os.environ.get(
     "CSI_SIDECAR_REGISTRY", "registry.k8s.io"
 )
+BUSYBOX_IMAGE = os.environ.get(
+    "BUSYBOX_IMAGE",
+    "docker.io/library/busybox:1.37.0@sha256:"
+    "9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0",
+)
 KUBELET_DIR = os.environ.get("KUBELET_DIR")
 VERBOSE = os.environ.get("VERBOSE", "no")
 TEMPLATES_DIR = os.environ.get("KADALU_TEMPLATES_DIR", "/kadalu/templates")
@@ -1721,6 +1726,7 @@ def deploy_csi_pods(core_v1_client, provisioner_replicas=1):
              docker_user=docker_user, k8s_dist=K8S_DIST,
              images_hub=IMAGES_HUB,
              csi_sidecar_registry=CSI_SIDECAR_REGISTRY,
+             busybox_image=BUSYBOX_IMAGE,
              kubelet_dir=KUBELET_DIR, verbose=VERBOSE,
              provisioner_replicas=provisioner_replicas)
 

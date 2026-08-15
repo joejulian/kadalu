@@ -28,7 +28,7 @@ skopeo copy --all docker://ghcr.io/joejulian/kadalu-operator:<kadalu-version> \
   docker://registry.example.invalid:5000/kadalu/kadalu-operator:<kadalu-version>
 skopeo copy --all docker://ghcr.io/joejulian/kadalu-server:<kadalu-version> \
   docker://registry.example.invalid:5000/kadalu/kadalu-server:<kadalu-version>
-skopeo copy --all \
+skopeo copy --all --preserve-digests \
   docker://docker.io/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \
   docker://registry.example.invalid:5000/library/busybox:1.37.0
 
@@ -63,12 +63,18 @@ helm template kadalu ./helm/kadalu \
   --set-string global.image.registry=registry.example.invalid:5000 \
   --set-string global.image.repository=kadalu \
   --set-string global.csiSidecarRegistry=registry.example.invalid:5000 \
+  --set-string global.busyboxImage=registry.example.invalid:5000/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0 \
   > manifests/kadalu-operator-private-registry.yaml
 ----
 
-The Kadalu application images and BusyBox logging helper follow
-`global.image.registry`. CSI sidecars follow `global.csiSidecarRegistry`, so a
-fully disconnected deployment must mirror and configure both registries.
+Kadalu application images follow `global.image.registry`. The BusyBox logging
+helper uses the full reference in `global.busyboxImage`, and CSI sidecars follow
+`global.csiSidecarRegistry`. A fully disconnected deployment must mirror and
+configure all three image sources.
+
+When upgrading an existing private-registry deployment, add
+`global.busyboxImage` explicitly. It no longer follows
+`global.image.registry`.
 
 == Install Kubectl extension
 

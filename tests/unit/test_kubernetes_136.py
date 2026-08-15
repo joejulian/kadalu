@@ -9,6 +9,10 @@ from jinja2 import Template
 
 
 ROOT = Path(__file__).resolve().parents[2]
+BUSYBOX_IMAGE = (
+    "docker.io/library/busybox:1.37.0@sha256:"
+    "9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
+)
 SIDECAR_IMAGES = {
     "csi-node-driver-registrar": (
         "registry.k8s.io/sig-storage/csi-node-driver-registrar:"
@@ -46,6 +50,7 @@ def _render_csi_documents(provisioner_replicas=None):
         "kubelet_dir": "/var/lib/kubelet",
         "verbose": "no",
         "csi_sidecar_registry": "registry.k8s.io",
+        "busybox_image": BUSYBOX_IMAGE,
     }
     if provisioner_replicas is not None:
         values["provisioner_replicas"] = provisioner_replicas
@@ -103,6 +108,7 @@ def test_fork_images_default_to_ghcr_namespace():
         "repository": "joejulian",
         "pullPolicy": "IfNotPresent",
     }
+    assert values["global"]["busyboxImage"] == BUSYBOX_IMAGE
 
     for manifest in sorted((ROOT / "manifests").glob("kadalu-operator*.yaml")):
         documents = [
@@ -329,9 +335,23 @@ def test_node_health_check_never_restarts_fuse_owner():
         "path": "/healthz",
         "port": 9808,
     }
-    assert containers["kadalu-logging"]["image"].startswith(
-        "registry.example.invalid/library/busybox:"
+    assert containers["kadalu-logging"]["image"] == BUSYBOX_IMAGE
+
+
+def test_operator_passes_independent_busybox_image_to_runtime_renderer():
+    operator = next(
+        document
+        for document in _helm_documents()
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["name"] == "operator"
     )
+    container = operator["spec"]["template"]["spec"]["containers"][0]
+    environment = {
+        variable["name"]: variable.get("value")
+        for variable in container["env"]
+    }
+
+    assert environment["BUSYBOX_IMAGE"] == BUSYBOX_IMAGE
 
 
 def test_csi_rbac_supports_current_sidecar_apis():

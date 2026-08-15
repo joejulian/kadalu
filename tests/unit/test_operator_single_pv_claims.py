@@ -992,6 +992,33 @@ def test_deploy_csi_rejects_multiple_serving_controllers(monkeypatch):
         operator.deploy_csi_pods(object(), provisioner_replicas=2)
 
 
+def test_deploy_csi_passes_configured_busybox_image(monkeypatch, tmp_path):
+    operator = _load_operator(monkeypatch)
+    rendered = []
+    busybox_image = "registry.example.invalid/helpers/busybox:test"
+    core_client = SimpleNamespace(
+        list_namespaced_pod=lambda _namespace: SimpleNamespace(items=[]),
+    )
+
+    monkeypatch.setattr(operator, "MANIFESTS_DIR", str(tmp_path))
+    monkeypatch.setattr(operator, "BUSYBOX_IMAGE", busybox_image)
+    monkeypatch.setattr(
+        operator,
+        "template",
+        lambda filename, **values: rendered.append((filename, values)),
+    )
+    monkeypatch.setattr(operator, "lib_execute", lambda *_args: None)
+
+    operator.deploy_csi_pods(core_client)
+
+    csi_values = next(
+        values
+        for filename, values in rendered
+        if filename.endswith("/csi.yaml")
+    )
+    assert csi_values["busybox_image"] == busybox_image
+
+
 def test_subvolume_only_upgrade_does_not_delete_nodeplugin(monkeypatch):
     operator = _load_operator(monkeypatch)
     calls = []

@@ -468,6 +468,8 @@ spec:
               value: "joejulian"
             - name: CSI_SIDECAR_REGISTRY
               value: "registry.k8s.io"
+            - name: BUSYBOX_IMAGE
+              value: "docker.io/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
             - name: KADALU_VERSION
               value: "devel"
             - name: KADALU_NAMESPACE
