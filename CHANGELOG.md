@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Builder, GlusterFS: Preserve namespace markers during replica metadata heal so
+  namespace-protected PVC roots do not remain pending after a brick outage.
+- CSI: Restore quota namespace markers only after the corresponding EPERM;
+  successful quota updates no longer rewrite the protected marker repeatedly.
 - Helm, Operator: Configure the BusyBox logging helper independently from the
   Kadalu application image registry. Private-registry deployments must now set
   `global.busyboxImage` explicitly.
