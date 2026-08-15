@@ -128,7 +128,7 @@ spec:
             - name: plugin-dir
               mountPath: /plugin
         - name: kadalu-logging
-          image: {{ images_hub }}/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+          image: {{ busybox_image }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
           args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -f /var/log/gluster/*.log"]
@@ -280,7 +280,7 @@ spec:
               readOnly: true
               mountPath: "/etc/secret-volume"
         - name: kadalu-logging
-          image: {{ images_hub }}/library/busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
+          image: {{ busybox_image }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
           args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -F /var/log/gluster/*.log"]
