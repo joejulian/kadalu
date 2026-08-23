@@ -288,7 +288,7 @@ def test_operator_upgrade_avoids_normal_rolling_overlap():
     }
 
 
-def test_operator_upgrade_deadline_outlives_nodeplugin_gate():
+def test_operator_progress_deadline_is_configurable_backstop():
     operator = next(
         document
         for document in _helm_documents()
@@ -296,7 +296,7 @@ def test_operator_upgrade_deadline_outlives_nodeplugin_gate():
         and document.get("metadata", {}).get("name") == "operator"
     )
 
-    assert operator["spec"]["progressDeadlineSeconds"] == 4200
+    assert operator["spec"]["progressDeadlineSeconds"] == 86400
 
     overridden_operator = next(
         document

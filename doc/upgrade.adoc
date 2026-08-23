@@ -45,9 +45,18 @@ do not wait for the operator rollout first.
 ----
 kubectl -n kadalu get daemonset kadalu-csi-nodeplugin \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+kubectl -n kadalu get daemonset kadalu-csi-nodeplugin \
+  -o custom-columns='GENERATION:.metadata.generation,OBSERVED:.status.observedGeneration,DESIRED:.status.desiredNumberScheduled,CURRENT:.status.currentNumberScheduled,UPDATED:.status.updatedNumberScheduled,READY:.status.numberReady,AVAILABLE:.status.numberAvailable,MISSCHEDULED:.status.numberMisscheduled,UNAVAILABLE:.status.numberUnavailable'
 ----
 
-Upgrade one node at a time during a maintenance window:
+Remove misscheduled stale pods first, one node at a time during a maintenance
+window. Safely drain the node, delete its node-plugin pod, and verify that no
+replacement appears because the node is outside the current desired schedule.
+After each deletion, `MISSCHEDULED` must decrease while `DESIRED`, `CURRENT`,
+`READY`, and `AVAILABLE` remain unchanged. Stop if those invariants do not hold.
+Use normal deletion and do not bypass graceful termination.
+
+Then upgrade each desired outdated node one at a time:
 
 . Cordon and safely drain the node according to your workload disruption
   policy.
@@ -69,6 +78,10 @@ kubectl uncordon <node>
 Choose drain flags appropriate for the cluster. Stop and investigate any mount
 or workload failure before continuing to another node.
 
+Before proceeding, verify that `GENERATION` equals `OBSERVED`; `DESIRED`,
+`CURRENT`, `UPDATED`, `READY`, and `AVAILABLE` are equal; `MISSCHEDULED` is
+zero; and `UNAVAILABLE` is zero or omitted.
+
 == Verify the controller workloads
 
 After every desired node-plugin pod uses the new template and is Ready, wait
@@ -80,3 +93,8 @@ kubectl -n kadalu rollout status deployment/operator --timeout=75m
 kubectl -n kadalu rollout status statefulset/kadalu-csi-provisioner --timeout=5m
 kubectl -n kadalu get pods
 ----
+
+Size the Helm, GitOps, and `rollout status` timeouts for the manual node
+rotation plus serial reconciliation of every existing storage pool. The
+operator Deployment's default 24-hour progress deadline is only a final
+diagnostic backstop, not the normal maintenance timeout.

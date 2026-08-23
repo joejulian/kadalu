@@ -430,7 +430,7 @@ metadata:
     app.kubernetes.io/component: operator
 spec:
   replicas: 1
-  progressDeadlineSeconds: 4200
+  progressDeadlineSeconds: 86400
   strategy:
     type: RollingUpdate
     rollingUpdate:
