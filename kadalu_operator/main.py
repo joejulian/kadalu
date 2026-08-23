@@ -2262,17 +2262,24 @@ def _nodeplugin_template_tolerations(apps_v1_client):
             "current nodeplugin scheduling policy is unavailable"
         ) from err
 
+    return _nodeplugin_tolerations(
+        daemon_set,
+        "Current nodeplugin template",
+    )
+
+
+def _nodeplugin_tolerations(daemon_set, context):
+    """Read and normalize one nodeplugin DaemonSet template."""
     spec = getattr(daemon_set, "spec", None)
     pod_template = getattr(spec, "template", None)
     pod_spec = getattr(pod_template, "spec", None)
     if pod_spec is None:
         raise RuntimeError(
-            "A legacy External orphan has no persisted tolerations and the "
-            "current nodeplugin scheduling policy is invalid"
+            f"{context} scheduling policy is invalid"
         )
     return normalize_tolerations(
         getattr(pod_spec, "tolerations", None),
-        "Current nodeplugin template",
+        context,
     )
 
 
@@ -2697,6 +2704,19 @@ def reconcile_nodeplugin_from_storage(
     return storage_plan
 
 
+def prepare_watch_storage_snapshot(
+        core_v1_client, apps_v1_client, storage_client,
+        storage_list=None):
+    """Build one authoritative watch plan without mutating nodeplugins."""
+    if storage_list is None:
+        storage_list = list_storage_resources(storage_client)
+    return prepare_storage_upgrade(
+        core_v1_client,
+        apps_v1_client,
+        storage_list,
+    )
+
+
 def gate_nodeplugin_until_current(
         core_v1_client, apps_v1_client, storage_client, storage_plan,
         current_tolerations=None):
@@ -2710,7 +2730,10 @@ def gate_nodeplugin_until_current(
                 apps_v1_client,
                 desired_tolerations,
             )
-            wait_for_csi_nodeplugin_rollout(apps_v1_client)
+            wait_for_csi_nodeplugin_rollout(
+                apps_v1_client,
+                expected_tolerations=desired_tolerations,
+            )
             gated_tolerations = desired_tolerations
 
         fresh = prepare_storage_upgrade(
@@ -4616,8 +4639,10 @@ def handle_deleted(
         return False
 
     safe_to_resume = False
+    reconciliation_succeeded = False
     try:
         if owns_fence:
+            clear_operator_ready()
             quiesce_csi_provisioner(core_v1_client, apps_v1_client)
 
         if core_v1_client is None:
@@ -4643,6 +4668,7 @@ def handle_deleted(
             # shared provisioner even when ownership proof was quarantined.
             safe_to_resume = True
             if not cleanup_owned:
+                reconciliation_succeeded = True
                 return True
             _validate_deletion_record_owner(obj, storage_info_data)
         authoritative = _read_deletion_storage_info(
@@ -4666,6 +4692,7 @@ def handle_deleted(
                 "Storage deletion completed while waiting for the fence",
                 storage=volname,
             ))
+            reconciliation_succeeded = True
             return True
         _validate_deletion_snapshot(
             obj,
@@ -4690,6 +4717,7 @@ def handle_deleted(
                 "Preserved quarantined cleanup-only storage pool",
                 storage=volname,
             ))
+            reconciliation_succeeded = True
             return True
         hostvol_type = storage_info_data.get("type")
         # Stop admitting new claims only after the fenced authoritative record
@@ -4721,6 +4749,7 @@ def handle_deleted(
                 storage=volname,
                 error=err,
             ))
+            reconciliation_succeeded = True
             return True
 
         # The tombstone excludes custom as well as generated StorageClasses.
@@ -4740,6 +4769,7 @@ def handle_deleted(
                 number_of_pvs=pv_count,
                 storage=volname,
             ))
+            reconciliation_succeeded = True
             return True
 
         latest = _read_deletion_storage_info(core_v1_client, volname)
@@ -4748,6 +4778,7 @@ def handle_deleted(
                 "Storage deletion completed after PersistentVolume drain",
                 storage=volname,
             ))
+            reconciliation_succeeded = True
             return True
         _validate_deletion_snapshot(obj, storage_info_data, latest)
         storage_info_data = latest
@@ -4774,10 +4805,22 @@ def handle_deleted(
             obj,
             storage_info_data,
         )
+        reconciliation_succeeded = True
         return True
     finally:
         if owns_fence and safe_to_resume:
-            resume_csi_provisioner(apps_v1_client)
+            try:
+                resume_csi_provisioner(apps_v1_client)
+                wait_for_csi_provisioner_rollout(apps_v1_client)
+                if reconciliation_succeeded:
+                    mark_operator_ready()
+            except Exception:  # pylint: disable=broad-exception-caught
+                clear_operator_ready()
+                quiesce_csi_provisioner(
+                    core_v1_client,
+                    apps_v1_client,
+                )
+                raise
 
 
 def get_configmap_data(volname):
@@ -5004,9 +5047,18 @@ def reconcile_initial_storage(
 
 def reconcile_watch_storage_until_stable(
         core_v1_client, apps_v1_client, storage_client, storage_plan):
-    """Re-plan after orphan cleanup so newly unblocked CRs are reconciled."""
+    """Reconcile watch snapshots without outrunning nodeplugin placement."""
     candidate = storage_plan
+    current_tolerations = current_csi_nodeplugin_tolerations(apps_v1_client)
     while True:
+        if candidate["nodeplugin_tolerations"] != current_tolerations:
+            return reconcile_fenced_watch_storage(
+                core_v1_client,
+                apps_v1_client,
+                storage_client,
+                candidate,
+                current_tolerations,
+            )
         candidate_fingerprint = _storage_plan_fingerprint(candidate)
         reconcile_initial_storage(
             core_v1_client,
@@ -5022,14 +5074,49 @@ def reconcile_watch_storage_until_stable(
         )
         if not candidate["deletion_orphans"]:
             return candidate
-        fresh = reconcile_nodeplugin_from_storage(
+        fresh = prepare_storage_upgrade(
             core_v1_client,
             apps_v1_client,
-            storage_client,
+            list_storage_resources(storage_client),
         )
         if _storage_plan_fingerprint(fresh) == candidate_fingerprint:
             return fresh
         candidate = fresh
+
+
+def reconcile_fenced_watch_storage(
+        core_v1_client, apps_v1_client, storage_client, storage_plan,
+        current_tolerations):
+    """Advance a runtime nodeplugin policy under the CSI serving fence."""
+    clear_operator_ready()
+    quiesce_csi_provisioner(core_v1_client, apps_v1_client)
+    try:
+        storage_plan = gate_nodeplugin_until_current(
+            core_v1_client,
+            apps_v1_client,
+            storage_client,
+            storage_plan,
+            current_tolerations=current_tolerations,
+        )
+        storage_plan = reconcile_storage_until_stable(
+            core_v1_client,
+            apps_v1_client,
+            storage_client,
+            storage_plan,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        clear_operator_ready()
+        raise
+
+    try:
+        resume_csi_provisioner(apps_v1_client)
+        wait_for_csi_provisioner_rollout(apps_v1_client)
+        mark_operator_ready()
+    except Exception:  # pylint: disable=broad-exception-caught
+        clear_operator_ready()
+        quiesce_csi_provisioner(core_v1_client, apps_v1_client)
+        raise
+    return storage_plan
 
 
 def watch_stream(
@@ -5043,11 +5130,11 @@ def watch_stream(
         initial_list = list_storage_resources(crds)
         initial_items = initial_list["items"]
         if core_v1_client is not None and apps_v1_client is not None:
-            storage_plan = reconcile_nodeplugin_from_storage(
+            storage_plan = prepare_watch_storage_snapshot(
                 core_v1_client,
                 apps_v1_client,
                 crds,
-                storage_list=initial_list,
+                initial_list,
             )
             storage_plan = reconcile_watch_storage_until_stable(
                 core_v1_client,
@@ -5069,7 +5156,7 @@ def watch_stream(
         # retained while nonempty is cleaned once its last PV disappears.
         # Resume after the authoritative snapshot: cleanup can remove an old
         # ownership marker, so replaying pre-snapshot events is unsafe.
-        storage_plan = reconcile_nodeplugin_from_storage(
+        storage_plan = prepare_watch_storage_snapshot(
             core_v1_client,
             apps_v1_client,
             crds,
@@ -5115,6 +5202,10 @@ def watch_stream(
             )
 
         logging.debug(logf("Event", operation=operation, object=repr(obj)))
+        snapshot_reconcile = (
+            core_v1_client is not None and apps_v1_client is not None
+        )
+        event_quarantined = False
         if (
                 operation in ("ADDED", "MODIFIED")
                 and not validate_volume_request(obj)):
@@ -5124,6 +5215,7 @@ def watch_stream(
                 storage=metadata.get("name", "<unknown>"),
             ))
             reconciled = True
+            event_quarantined = True
         elif event_targets_deletion_blocked_record(core_v1_client, obj):
             logging.error(logf(
                 "Acknowledged quarantined Kadalustorage event for "
@@ -5131,6 +5223,12 @@ def watch_stream(
                 operation=operation,
                 storage=metadata.get("name", "<unknown>"),
             ))
+            reconciled = True
+            event_quarantined = True
+        elif snapshot_reconcile:
+            # Reconcile the authoritative post-event snapshot. In particular,
+            # do not let an ADDED or MODIFIED handler create pool resources
+            # before its desired nodeplugin placement has been gated.
             reconciled = True
         elif operation == "ADDED":
             reconciled = handle_added(
@@ -5159,8 +5257,8 @@ def watch_stream(
                 f"{operation} reconciliation failed for "
                 f"Kadalustorage {name}"
             )
-        if core_v1_client is not None and apps_v1_client is not None:
-            storage_plan = reconcile_nodeplugin_from_storage(
+        if snapshot_reconcile:
+            storage_plan = prepare_watch_storage_snapshot(
                 core_v1_client,
                 apps_v1_client,
                 crds,
@@ -5171,6 +5269,32 @@ def watch_stream(
                 crds,
                 storage_plan,
             )
+            storage_name = metadata.get("name")
+            tombstone_shadowed = any(
+                (item.get("metadata") or {}).get("name") == storage_name
+                for item in storage_plan["items"]
+            ) or any(
+                (orphan["object"].get("metadata") or {}).get("name")
+                == storage_name
+                for orphan in storage_plan["deletion_orphans"]
+            )
+            if (
+                    operation == "DELETED"
+                    and not event_quarantined
+                    and not tombstone_shadowed
+                    and _read_deletion_storage_info(
+                        core_v1_client,
+                        storage_name,
+                    ) is None
+                    and not handle_deleted(
+                        core_v1_client,
+                        obj,
+                        apps_v1_client=apps_v1_client,
+                    )):
+                raise RuntimeError(
+                    "DELETED tombstone reconciliation failed for "
+                    f"Kadalustorage {storage_name or '<unknown>'}"
+                )
             # The LIST may have reconciled changes beyond this watch event.
             # End this stream so buffered pre-snapshot events cannot mutate
             # state after cleanup removed its ownership tombstone.
@@ -5267,9 +5391,19 @@ def csi_nodeplugin_rollout_complete(daemon_set):
         return False
 
     desired = getattr(status, "desired_number_scheduled", None)
+    current = getattr(status, "current_number_scheduled", None)
+    misscheduled = getattr(status, "number_misscheduled", None)
     updated = getattr(status, "updated_number_scheduled", None)
     ready = getattr(status, "number_ready", None)
-    if desired is None or updated is None or ready is None:
+    available = getattr(status, "number_available", None)
+    unavailable = getattr(status, "number_unavailable", None)
+    if (
+            desired is None
+            or current is None
+            or misscheduled is None
+            or updated is None
+            or ready is None
+            or available is None):
         return False
 
     generation = getattr(metadata, "generation", None)
@@ -5279,7 +5413,14 @@ def csi_nodeplugin_rollout_complete(daemon_set):
             or observed is None
             or observed < generation):
         return False
-    return updated == desired and ready == desired
+    return (
+        current == desired
+        and misscheduled == 0
+        and updated == desired
+        and ready == desired
+        and available == desired
+        and unavailable in (None, 0)
+    )
 
 
 def read_csi_nodeplugin(apps_v1_client):
@@ -5295,15 +5436,41 @@ def read_csi_nodeplugin(apps_v1_client):
         return None
 
 
+def current_csi_nodeplugin_tolerations(apps_v1_client):
+    """Return the template policy only when every desired pod is current."""
+    daemon_set = read_csi_nodeplugin(apps_v1_client)
+    if not csi_nodeplugin_rollout_complete(daemon_set):
+        return None
+    return _nodeplugin_tolerations(
+        daemon_set,
+        "Current nodeplugin template",
+    )
+
+
 def wait_for_csi_nodeplugin_rollout(
         apps_v1_client,
         timeout_seconds=CSI_NODEPLUGIN_ROLLOUT_TIMEOUT_SECONDS,
-        poll_interval=1):
+        poll_interval=1, expected_tolerations=None):
     """Wait for an explicitly advanced OnDelete nodeplugin rollout."""
+    if expected_tolerations is not None:
+        expected_tolerations = normalize_tolerations(
+            expected_tolerations,
+            "Expected nodeplugin template",
+        )
     deadline = time.monotonic() + timeout_seconds
     while True:
         daemon_set = read_csi_nodeplugin(apps_v1_client)
         if csi_nodeplugin_rollout_complete(daemon_set):
+            if (
+                    expected_tolerations is not None
+                    and _nodeplugin_tolerations(
+                        daemon_set,
+                        "Current nodeplugin template",
+                    ) != expected_tolerations):
+                raise RuntimeError(
+                    "CSI nodeplugin template changed during rollout; "
+                    "the CSI provisioner remains fenced"
+                )
             logging.info("CSI nodeplugin rollout is complete")
             return
         if time.monotonic() >= deadline:
