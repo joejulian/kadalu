@@ -18,3 +18,8 @@ global:
 operator:
   enabled: false
   verbose: 'no'
+  # Operator readiness includes a manual OnDelete rollout and topology-sized,
+  # serial storage reconciliation. Keep this as a long Kubernetes diagnostic
+  # backstop; use the shorter Helm or GitOps action timeout as the operational
+  # failure boundary and size it for the planned maintenance.
+  progressDeadlineSeconds: 86400

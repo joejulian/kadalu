@@ -93,7 +93,7 @@ def _render_server(tolerations):
     return yaml.safe_load(rendered)
 
 
-def _helm_documents():
+def _helm_documents(*extra_args):
     try:
         rendered = subprocess.run(
             [
@@ -105,6 +105,7 @@ def _helm_documents():
                 "the-vault",
                 "--set",
                 "operator.enabled=true",
+                *extra_args,
             ],
             cwd=ROOT,
             check=True,
@@ -285,6 +286,28 @@ def test_operator_upgrade_avoids_normal_rolling_overlap():
             "maxUnavailable": 1,
         },
     }
+
+
+def test_operator_progress_deadline_is_configurable_backstop():
+    operator = next(
+        document
+        for document in _helm_documents()
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "operator"
+    )
+
+    assert operator["spec"]["progressDeadlineSeconds"] == 86400
+
+    overridden_operator = next(
+        document
+        for document in _helm_documents(
+            "--set", "operator.progressDeadlineSeconds=4321"
+        )
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "operator"
+    )
+
+    assert overridden_operator["spec"]["progressDeadlineSeconds"] == 4321
 
 
 def test_operator_readiness_tracks_the_reconciler_process():
