@@ -328,7 +328,9 @@ def _server_statefulset_evidence(**pod_kwargs):
 
 def _nodeplugin_daemonset(
         *, current=True, tolerations=None, generation=4,
-        observed_generation=4):
+        observed_generation=4, current_number_scheduled=None,
+        number_misscheduled=0, number_available=None,
+        number_unavailable=None):
     desired = 2
     return SimpleNamespace(
         metadata=SimpleNamespace(generation=generation),
@@ -339,8 +341,18 @@ def _nodeplugin_daemonset(
         ),
         status=SimpleNamespace(
             desired_number_scheduled=desired,
+            current_number_scheduled=(
+                desired
+                if current_number_scheduled is None
+                else current_number_scheduled
+            ),
+            number_misscheduled=number_misscheduled,
             updated_number_scheduled=desired if current else 1,
             number_ready=desired,
+            number_available=(
+                desired if number_available is None else number_available
+            ),
+            number_unavailable=number_unavailable,
             observed_generation=observed_generation,
         ),
     )
@@ -606,6 +618,86 @@ def _storage_plan(
             [] if deletion_orphans is None else deletion_orphans
         ),
     }
+
+
+def _assume_current_nodeplugin(monkeypatch, operator, tolerations=None):
+    """Keep watch tests focused on behavior outside nodeplugin transitions."""
+    current = [] if tolerations is None else tolerations
+    monkeypatch.setattr(
+        operator,
+        "current_csi_nodeplugin_tolerations",
+        lambda _apps: current,
+    )
+
+
+def _assume_provisioner_rollout(monkeypatch, operator):
+    """Keep deletion tests focused on behavior after a successful resume."""
+    monkeypatch.setattr(
+        operator,
+        "wait_for_csi_provisioner_rollout",
+        lambda _apps: None,
+    )
+
+
+def _record_provisioner_lifecycle(
+        monkeypatch, operator, events, rollout_error=None):
+    """Record the shared controller fence and readiness handoff."""
+    monkeypatch.setattr(
+        operator,
+        "clear_operator_ready",
+        lambda: events.append("operator-unready"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "quiesce_csi_provisioner",
+        lambda *_args: events.append("quiesce"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "resume_csi_provisioner",
+        lambda _apps: events.append("resume"),
+    )
+
+    def wait_for_rollout(_apps):
+        events.append("wait-provisioner")
+        if rollout_error is not None:
+            raise rollout_error
+
+    monkeypatch.setattr(
+        operator,
+        "wait_for_csi_provisioner_rollout",
+        wait_for_rollout,
+    )
+    monkeypatch.setattr(
+        operator,
+        "mark_operator_ready",
+        lambda: events.append("operator-ready"),
+    )
+
+
+def _install_watch_events(
+        monkeypatch, operator, k8s_client, events):
+    """Install one minimal custom-resource watch for event behavior tests."""
+    storage_client = SimpleNamespace(
+        list_namespaced_custom_object=lambda *_args, **_kwargs: None,
+    )
+    fake_watch = SimpleNamespace(
+        stream=lambda *_args, **_kwargs: iter(events),
+    )
+    monkeypatch.setattr(
+        operator.client,
+        "CustomObjectsApi",
+        lambda received: storage_client
+        if received is k8s_client else pytest.fail("unexpected API client"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operator.watch,
+        "Watch",
+        lambda: fake_watch,
+        raising=False,
+    )
+    return storage_client
 
 
 def _assert_mount_metadata(operator, record):
@@ -4034,6 +4126,66 @@ def test_nodeplugin_rollout_requires_metadata_generation(monkeypatch):
     ) is False
 
 
+@pytest.mark.parametrize(
+    "status_overrides",
+    [
+        {"current_number_scheduled": 1},
+        {"number_misscheduled": 1},
+        {"number_available": 1},
+        {"number_unavailable": 1},
+    ],
+    ids=["not-current", "misscheduled", "not-available", "unavailable"],
+)
+def test_nodeplugin_rollout_rejects_incomplete_status(
+        monkeypatch, status_overrides):
+    operator = _load_operator(monkeypatch)
+
+    assert operator.csi_nodeplugin_rollout_complete(
+        _nodeplugin_daemonset(**status_overrides)
+    ) is False
+
+
+def test_nodeplugin_gate_rejects_intervening_template_revision(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    desired_tolerations = [{
+        "key": "bellagio-storage",
+        "operator": "Exists",
+    }]
+    storage_plan = _storage_plan(tolerations=desired_tolerations)
+    events = []
+    apps_client = SimpleNamespace(
+        read_namespaced_daemon_set=lambda *_args: _nodeplugin_daemonset(
+            tolerations=[{
+                "key": "mirage-decoy",
+                "operator": "Exists",
+            }],
+        ),
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_nodeplugin_tolerations",
+        lambda _apps, tolerations: events.append(("patch", tolerations)),
+    )
+    monkeypatch.setattr(
+        operator,
+        "list_storage_resources",
+        lambda _storage: pytest.fail(
+            "template race was accepted as the desired rollout"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="changed during rollout"):
+        operator.gate_nodeplugin_until_current(
+            object(),
+            apps_client,
+            object(),
+            storage_plan,
+            current_tolerations=[],
+        )
+
+    assert events == [("patch", desired_tolerations)]
+
+
 def test_deploy_csi_rejects_multiple_serving_controllers(monkeypatch):
     operator = _load_operator(monkeypatch)
 
@@ -4124,8 +4276,14 @@ def test_csi_upgrade_keeps_provisioner_fenced_after_nodeplugin_rollout(
     monkeypatch.setattr(
         operator,
         "wait_for_csi_nodeplugin_rollout",
-        lambda received: calls.append("wait-nodeplugin")
-        if received is apps_client else None,
+        lambda received, expected_tolerations=None: (
+            calls.append("wait-nodeplugin")
+            if (
+                received is apps_client
+                and expected_tolerations
+                == storage_plan["nodeplugin_tolerations"]
+            ) else None
+        ),
     )
     monkeypatch.setattr(operator.time, "sleep", lambda _seconds: None)
 
@@ -4208,7 +4366,8 @@ def test_csi_upgrade_regates_changed_union_and_returns_fresh_plan(
     monkeypatch.setattr(
         operator,
         "wait_for_csi_nodeplugin_rollout",
-        lambda _apps: calls.append("wait"),
+        lambda _apps, expected_tolerations=None: calls.append("wait")
+        if expected_tolerations == changed_tolerations else None,
     )
 
     result = operator.deploy_csi_upgrade(
@@ -5620,9 +5779,10 @@ def test_modified_missing_pool_passes_rollout_client_to_added_handler(
     assert additions == [(core_client, obj, apps_client)]
 
 
-def test_watch_stream_passes_rollout_client_to_initial_and_first_event_handler(
+def test_watch_stream_passes_rollout_client_to_snapshot_handlers(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     core_client = object()
     k8s_client = object()
     apps_client = object()
@@ -5709,7 +5869,7 @@ def test_watch_stream_passes_rollout_client_to_initial_and_first_event_handler(
     def reconcile_union(core, apps, storage, storage_list=None):
         calls.append(("union", core, apps, storage, storage_list))
         return _storage_plan(
-            items=initial_list["items"] if storage_list else [],
+            items=initial_list["items"] if storage_list else [added],
         ) | {"resource_version": next(resource_versions)}
 
     initial_list = {
@@ -5718,7 +5878,7 @@ def test_watch_stream_passes_rollout_client_to_initial_and_first_event_handler(
     }
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         reconcile_union,
         raising=False,
     )
@@ -5732,8 +5892,8 @@ def test_watch_stream_passes_rollout_client_to_initial_and_first_event_handler(
     assert calls == [
         ("union", core_client, apps_client, custom_objects, initial_list),
         ("added", core_client, initial, apps_client),
-        ("added", core_client, added, apps_client),
         ("union", core_client, apps_client, custom_objects, None),
+        ("added", core_client, added, apps_client),
     ]
 
 
@@ -5794,7 +5954,7 @@ def test_watch_stream_quarantines_cleanup_only_pool_events(
     monkeypatch.setattr(operator.watch, "Watch", FakeWatch, raising=False)
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda core, apps, storage: (
             aggregate_calls.append((core, apps, storage))
             or next(storage_plans)
@@ -5904,7 +6064,7 @@ def test_watch_resumes_after_snapshot_that_removed_cleanup_marker(
     monkeypatch.setattr(operator.watch, "Watch", FakeWatch, raising=False)
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda core, apps, storage: blocked_plan
         if (core, apps, storage) == (
             core_client,
@@ -7788,6 +7948,16 @@ def test_deleted_nonempty_orphan_retires_class_but_remains_serviceable(
     )
     monkeypatch.setattr(
         operator,
+        "wait_for_csi_provisioner_rollout",
+        lambda apps: events.append(("wait", apps)),
+    )
+    monkeypatch.setattr(
+        operator,
+        "mark_operator_ready",
+        lambda: events.append("operator-ready"),
+    )
+    monkeypatch.setattr(
+        operator,
         "delete_config_map",
         lambda *_args: pytest.fail("nonempty pool metadata was deleted"),
     )
@@ -7809,6 +7979,8 @@ def test_deleted_nonempty_orphan_retires_class_but_remains_serviceable(
         "storage-class",
         "pv-count",
         ("resume", apps_client),
+        ("wait", apps_client),
+        "operator-ready",
     ]
     saved = _saved_record(core_client)
     assert saved["provisioning_disabled"] is True
@@ -7915,6 +8087,7 @@ def test_zero_pv_runtime_delete_fences_rechecks_and_resumes(monkeypatch):
     core_client = FakeCoreV1Client({f"{POOL_NAME}.info": record})
     apps_client = object()
     original_patch = core_client.patch_namespaced_config_map
+    _record_provisioner_lifecycle(monkeypatch, operator, events)
 
     def patch_config_map(*args):
         events.append("tombstone")
@@ -7937,11 +8110,6 @@ def test_zero_pv_runtime_delete_fences_rechecks_and_resumes(monkeypatch):
     )
     monkeypatch.setattr(
         operator,
-        "quiesce_csi_provisioner",
-        lambda _core, apps: events.append(("fence", apps)),
-    )
-    monkeypatch.setattr(
-        operator,
         "delete_server_pods",
         lambda *_args: events.append("servers"),
     )
@@ -7960,12 +8128,6 @@ def test_zero_pv_runtime_delete_fences_rechecks_and_resumes(monkeypatch):
         "delete_config_map",
         lambda *_args: events.append("config-map"),
     )
-    monkeypatch.setattr(
-        operator,
-        "resume_csi_provisioner",
-        lambda apps: events.append(("resume", apps)),
-    )
-
     assert operator.handle_deleted(
         core_client,
         deletion_obj,
@@ -7973,7 +8135,8 @@ def test_zero_pv_runtime_delete_fences_rechecks_and_resumes(monkeypatch):
         apps_v1_client=apps_client,
     ) is True
     assert events == [
-        ("fence", apps_client),
+        "operator-unready",
+        "quiesce",
         "tombstone",
         "storage-class",
         "pv-count",
@@ -7981,13 +8144,55 @@ def test_zero_pv_runtime_delete_fences_rechecks_and_resumes(monkeypatch):
         "service-manifest",
         "service-delete",
         "config-map",
-        ("resume", apps_client),
+        "resume",
+        "wait-provisioner",
+        "operator-ready",
+    ]
+
+
+def test_runtime_delete_resume_timeout_refences_and_stays_unready(
+        monkeypatch):
+    operator = _load_operator(monkeypatch)
+    record = _stored_native_pool()
+    deletion_obj = _deletion_object(record)
+    core_client = FakeCoreV1Client({})
+    apps_client = object()
+    events = []
+    _record_provisioner_lifecycle(
+        monkeypatch,
+        operator,
+        events,
+        TimeoutError("Bellagio provisioner stayed unavailable"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "delete_storage_class",
+        lambda *_args, **_kwargs: events.append("storage-class"),
+    )
+
+    with pytest.raises(TimeoutError, match="stayed unavailable"):
+        operator.handle_deleted(
+            core_client,
+            deletion_obj,
+            storage_info_data=record,
+            apps_v1_client=apps_client,
+        )
+
+    assert events == [
+        "operator-unready",
+        "quiesce",
+        "storage-class",
+        "resume",
+        "wait-provisioner",
+        "operator-unready",
+        "quiesce",
     ]
 
 
 def test_runtime_delete_preserves_pool_if_pv_exists_after_tombstone(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_provisioner_rollout(monkeypatch, operator)
     events = []
     record = _stored_native_pool()
     deletion_obj = _deletion_object(record)
@@ -8052,6 +8257,7 @@ def test_runtime_delete_preserves_pool_if_pv_exists_after_tombstone(
 
 def test_existing_tombstone_migrates_cleanup_marker_under_fence(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_provisioner_rollout(monkeypatch, operator)
     events = []
     record = _stored_native_pool()
     record["provisioning_disabled"] = True
@@ -8269,6 +8475,7 @@ def test_cleanup_only_nonempty_retry_does_not_fence(monkeypatch):
 
 def test_cleanup_only_zero_precheck_refences_and_recounts(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_provisioner_rollout(monkeypatch, operator)
     events = []
     record = _stored_native_pool()
     record.update({
@@ -8373,6 +8580,7 @@ def test_runtime_delete_resumes_other_pools_after_cleanup_failure(monkeypatch):
     core_client = FakeCoreV1Client({f"{POOL_NAME}.info": record})
     apps_client = object()
     original_patch = core_client.patch_namespaced_config_map
+    _record_provisioner_lifecycle(monkeypatch, operator, events)
 
     def patch_config_map(*args):
         events.append("tombstone")
@@ -8391,22 +8599,11 @@ def test_runtime_delete_resumes_other_pools_after_cleanup_failure(monkeypatch):
     monkeypatch.setattr(operator, "delete_storage_class", lambda *_args: None)
     monkeypatch.setattr(
         operator,
-        "quiesce_csi_provisioner",
-        lambda _core, apps: events.append(("fence", apps)),
-    )
-    monkeypatch.setattr(
-        operator,
         "delete_server_pods",
         lambda *_args: (_ for _ in ()).throw(
             RuntimeError("Bellagio API unavailable")
         ),
     )
-    monkeypatch.setattr(
-        operator,
-        "resume_csi_provisioner",
-        lambda apps: events.append(("resume", apps)),
-    )
-
     with pytest.raises(RuntimeError, match="Bellagio API"):
         operator.handle_deleted(
             core_client,
@@ -8415,10 +8612,12 @@ def test_runtime_delete_resumes_other_pools_after_cleanup_failure(monkeypatch):
             apps_v1_client=apps_client,
         )
     assert events == [
-        ("fence", apps_client),
+        "operator-unready",
+        "quiesce",
         "tombstone",
         "pv-count",
-        ("resume", apps_client),
+        "resume",
+        "wait-provisioner",
     ]
 
 
@@ -8472,6 +8671,7 @@ def test_runtime_delete_tombstone_failure_keeps_provisioner_fenced(
 def test_runtime_delete_defers_class_failure_after_durable_tombstone(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_provisioner_rollout(monkeypatch, operator)
     events = []
     record = _stored_native_pool()
     deletion_obj = _deletion_object(record)
@@ -8769,6 +8969,7 @@ def test_fenced_storage_reconciliation_repeats_after_cr_mutation(
 
 def test_watch_replans_after_cleanup_unblocks_same_name_cr(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     replacement = _storage_custom_object()
     replacement["metadata"]["uid"] = "uid-benedict-replacement"
     record = _stored_native_pool()
@@ -8811,8 +9012,13 @@ def test_watch_replans_after_cleanup_unblocks_same_name_cr(monkeypatch):
     )
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
-        lambda *_args, **_kwargs: relists.append(True) or unblocked,
+        "list_storage_resources",
+        lambda _storage: relists.append(True) or object(),
+    )
+    monkeypatch.setattr(
+        operator,
+        "prepare_storage_upgrade",
+        lambda *_args: unblocked,
     )
 
     result = operator.reconcile_watch_storage_until_stable(
@@ -8826,6 +9032,185 @@ def test_watch_replans_after_cleanup_unblocks_same_name_cr(monkeypatch):
     assert reconciled_items == [[], [replacement]]
     assert deletion_plans == [blocked, unblocked]
     assert relists == [True]
+
+
+@pytest.mark.parametrize(
+    "published_tolerations",
+    [
+        [{"key": "bellagio-client", "operator": "Exists"}],
+        None,
+    ],
+    ids=["changed-template", "incomplete-ondelete-rollout"],
+)
+def test_watch_nodeplugin_change_fences_before_storage_reconciliation(
+        monkeypatch, published_tolerations):
+    operator = _load_operator(monkeypatch)
+    desired_tolerations = [{
+        "key": "mirage-storage",
+        "operator": "Exists",
+    }]
+    storage_plan = _storage_plan(tolerations=desired_tolerations)
+    core_client = object()
+    apps_client = object()
+    storage_client = object()
+    events = []
+    _record_provisioner_lifecycle(monkeypatch, operator, events)
+    monkeypatch.setattr(
+        operator,
+        "current_csi_nodeplugin_tolerations",
+        lambda _apps: published_tolerations,
+    )
+
+    def gate_current(_core, _apps, _storage, plan,
+                     current_tolerations=None):
+        assert current_tolerations == published_tolerations
+        events.append("patch-wait-nodeplugin")
+        return plan
+
+    monkeypatch.setattr(
+        operator,
+        "gate_nodeplugin_until_current",
+        gate_current,
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_storage_until_stable",
+        lambda _core, _apps, _storage, plan: (
+            events.append("reconcile-storage") or plan
+        ),
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_initial_storage",
+        lambda *_args, **_kwargs: pytest.fail(
+            "storage reconciliation ran before the nodeplugin gate"
+        ),
+    )
+    result = operator.reconcile_watch_storage_until_stable(
+        core_client,
+        apps_client,
+        storage_client,
+        storage_plan,
+    )
+
+    assert result is storage_plan
+    assert events == [
+        "operator-unready",
+        "quiesce",
+        "patch-wait-nodeplugin",
+        "reconcile-storage",
+        "resume",
+        "wait-provisioner",
+        "operator-ready",
+    ]
+
+
+def test_watch_nodeplugin_timeout_leaves_provisioner_fenced(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    storage_plan = _storage_plan(tolerations=[{
+        "key": "mirage-storage",
+        "operator": "Exists",
+    }])
+    apps_client = object()
+    events = []
+    _record_provisioner_lifecycle(monkeypatch, operator, events)
+    monkeypatch.setattr(
+        operator,
+        "current_csi_nodeplugin_tolerations",
+        lambda _apps: [],
+    )
+    monkeypatch.setattr(
+        operator,
+        "gate_nodeplugin_until_current",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            TimeoutError("Mirage nodeplugins await manual rotation")
+        ),
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_storage_until_stable",
+        lambda *_args: pytest.fail("storage reconciled after gate timeout"),
+    )
+    with pytest.raises(TimeoutError, match="manual rotation"):
+        operator.reconcile_watch_storage_until_stable(
+            object(),
+            apps_client,
+            object(),
+            storage_plan,
+        )
+
+    assert events == ["operator-unready", "quiesce", "operator-unready"]
+
+
+def test_fenced_watch_storage_failure_does_not_resume(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    storage_plan = _storage_plan()
+    events = []
+    _record_provisioner_lifecycle(monkeypatch, operator, events)
+    monkeypatch.setattr(
+        operator,
+        "gate_nodeplugin_until_current",
+        lambda *_args, **_kwargs: events.append("nodeplugin-current")
+        or storage_plan,
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_storage_until_stable",
+        lambda *_args: events.append("reconcile-storage")
+        or (_ for _ in ()).throw(RuntimeError("Bellagio storage failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="storage failed"):
+        operator.reconcile_fenced_watch_storage(
+            object(), object(), object(), storage_plan, [],
+        )
+
+    assert events == [
+        "operator-unready",
+        "quiesce",
+        "nodeplugin-current",
+        "reconcile-storage",
+        "operator-unready",
+    ]
+
+
+def test_fenced_watch_provisioner_timeout_refences(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    storage_plan = _storage_plan()
+    events = []
+    _record_provisioner_lifecycle(
+        monkeypatch,
+        operator,
+        events,
+        TimeoutError("Bellagio provisioner stayed unavailable"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "gate_nodeplugin_until_current",
+        lambda *_args, **_kwargs: events.append("nodeplugin-current")
+        or storage_plan,
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_storage_until_stable",
+        lambda *_args: events.append("reconcile-storage") or storage_plan,
+    )
+
+    with pytest.raises(TimeoutError, match="stayed unavailable"):
+        operator.reconcile_fenced_watch_storage(
+            object(), object(), object(), storage_plan, [],
+        )
+
+    assert events == [
+        "operator-unready",
+        "quiesce",
+        "nodeplugin-current",
+        "reconcile-storage",
+        "resume",
+        "wait-provisioner",
+        "operator-unready",
+        "quiesce",
+    ]
 
 
 def test_storage_plan_fingerprint_ignores_list_order_and_status_churn(
@@ -9237,6 +9622,7 @@ def test_handle_added_propagates_external_reconciliation_result(monkeypatch):
 def test_watch_stream_promotes_authoritative_snapshot_resource_version(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
 
     class CustomObjectsClient:
@@ -9262,7 +9648,7 @@ def test_watch_stream_promotes_authoritative_snapshot_resource_version(
     monkeypatch.setattr(operator.watch, "Watch", FakeWatch, raising=False)
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda *_args, **_kwargs: _storage_plan(resource_version="999"),
     )
     monkeypatch.setattr(
@@ -9283,6 +9669,7 @@ def test_watch_stream_promotes_authoritative_snapshot_resource_version(
 def test_watch_quarantines_invalid_event_and_continues_to_valid_pool(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
     invalid = {
         "metadata": {"name": "empty-bellagio", "resourceVersion": "8"},
@@ -9320,7 +9707,7 @@ def test_watch_quarantines_invalid_event_and_continues_to_valid_pool(
     )
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda *_args, **_kwargs: next(storage_plans),
     )
     monkeypatch.setattr(
@@ -9345,6 +9732,7 @@ def test_watch_quarantines_invalid_event_and_continues_to_valid_pool(
 
 def test_watch_handles_deleted_event_without_spec(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
     deleted = {
         "metadata": {
@@ -9373,26 +9761,41 @@ def test_watch_handles_deleted_event_without_spec(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(operator.watch, "Watch", FakeWatch, raising=False)
+    orphan = {
+        "object": deleted,
+        "record": _stored_native_pool("departed-bellagio"),
+    }
     monkeypatch.setattr(
         operator,
-        "handle_deleted",
-        lambda _core, obj, apps_v1_client=None: handled.append(obj) or True,
-    )
-    monkeypatch.setattr(
-        operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda *_args, **_kwargs: next(storage_plans),
     )
     monkeypatch.setattr(
         operator,
         "reconcile_deletion_orphans",
-        lambda *_args, **_kwargs: True,
+        lambda _core, orphans, _apps, **_kwargs: (
+            handled.extend(item["object"] for item in orphans) or True
+        ),
     )
 
+    event_plan = _storage_plan(
+        deletion_orphans=[orphan],
+        resource_version="21",
+    )
     storage_plans = iter([
         _storage_plan(resource_version="17"),
-        _storage_plan(resource_version="21"),
+        event_plan,
     ])
+    monkeypatch.setattr(
+        operator,
+        "list_storage_resources",
+        lambda _storage: object(),
+    )
+    monkeypatch.setattr(
+        operator,
+        "prepare_storage_upgrade",
+        lambda *_args: event_plan,
+    )
 
     assert operator.watch_stream(
         object(),
@@ -9403,9 +9806,109 @@ def test_watch_handles_deleted_event_without_spec(monkeypatch):
     assert handled == [deleted]
 
 
+def test_watch_deleted_record_absent_uses_custom_class_tombstone(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
+    deleted = _native_pool_object(storage_class_name="default")
+    deleted["metadata"].update({
+        "uid": "uid-bellagio-watch-delete",
+        "resourceVersion": "18",
+    })
+    storage_class = _owned_storage_class(operator, deleted, durable=True)
+    storage_api = FakeStorageV1Api([storage_class])
+    core_client = FakeCoreV1Client({})
+    k8s_client = object()
+    _install_watch_events(
+        monkeypatch,
+        operator,
+        k8s_client,
+        [{"type": "DELETED", "object": deleted}],
+    )
+
+    plans = iter([
+        _storage_plan(resource_version="17"),
+        _storage_plan(resource_version="21"),
+    ])
+    monkeypatch.setattr(
+        operator.client,
+        "StorageV1Api",
+        lambda: storage_api,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        operator,
+        "prepare_watch_storage_snapshot",
+        lambda *_args, **_kwargs: next(plans),
+    )
+    monkeypatch.setattr(
+        operator,
+        "lib_execute",
+        lambda *_args: pytest.fail("owned custom class used CLI deletion"),
+    )
+
+    assert operator.watch_stream(
+        core_client,
+        k8s_client,
+        object(),
+        resource_version="17",
+    ) == "21"
+    assert [name for name, _options in storage_api.deletes] == ["default"]
+
+
+def test_watch_stale_delete_does_not_touch_same_name_replacement(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    deleted = _storage_custom_object()
+    deleted["metadata"].update({
+        "uid": "uid-former-bellagio",
+        "resourceVersion": "18",
+    })
+    replacement = deepcopy(deleted)
+    replacement["metadata"]["uid"] = "uid-current-bellagio"
+    replacement_plan = _storage_plan(
+        items=[replacement],
+        resource_version="21",
+    )
+    plans = iter([
+        _storage_plan(resource_version="17"),
+        replacement_plan,
+    ])
+    k8s_client = object()
+    _install_watch_events(
+        monkeypatch,
+        operator,
+        k8s_client,
+        [{"type": "DELETED", "object": deleted}],
+    )
+    monkeypatch.setattr(
+        operator,
+        "prepare_watch_storage_snapshot",
+        lambda *_args, **_kwargs: next(plans),
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_watch_storage_until_stable",
+        lambda _core, _apps, _storage, plan: plan,
+    )
+    monkeypatch.setattr(
+        operator,
+        "handle_deleted",
+        lambda *_args, **_kwargs: pytest.fail(
+            "stale tombstone reached replacement cleanup"
+        ),
+    )
+
+    assert operator.watch_stream(
+        FakeCoreV1Client({}),
+        k8s_client,
+        object(),
+        resource_version="17",
+    ) == "21"
+
+
 def test_watch_restarts_after_newer_snapshot_before_buffered_events(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
     added = _storage_custom_object(name="bellagio")
     added["metadata"]["resourceVersion"] = "8"
@@ -9453,11 +9956,11 @@ def test_watch_restarts_after_newer_snapshot_before_buffered_events(
     )
     storage_plans = iter([
         _storage_plan(resource_version="7"),
-        _storage_plan(resource_version="12"),
+        _storage_plan(items=[added], resource_version="12"),
     ])
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda *_args, **_kwargs: next(storage_plans),
     )
     monkeypatch.setattr(
@@ -9479,6 +9982,7 @@ def test_watch_restarts_after_newer_snapshot_before_buffered_events(
 
 def test_watch_replays_unacked_event_after_aggregate_failure(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
     added = _storage_custom_object(name="bellagio")
     added["metadata"]["resourceVersion"] = "8"
@@ -9528,7 +10032,7 @@ def test_watch_replays_unacked_event_after_aggregate_failure(monkeypatch):
     )
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         reconcile_union,
     )
     monkeypatch.setattr(
@@ -9557,6 +10061,7 @@ def test_watch_replays_unacked_event_after_aggregate_failure(monkeypatch):
 
 def test_watch_timeout_retries_nonempty_deletion_orphans(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
     orphan = {
         "object": {"metadata": {"name": "bellagio-orphan"}},
@@ -9585,13 +10090,24 @@ def test_watch_timeout_retries_nonempty_deletion_orphans(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(operator.watch, "Watch", FakeWatch, raising=False)
+    storage_plan = _storage_plan(
+        deletion_orphans=[orphan],
+        resource_version="12",
+    )
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
-        lambda *_args, **_kwargs: _storage_plan(
-            deletion_orphans=[orphan],
-            resource_version="12",
-        ),
+        "prepare_watch_storage_snapshot",
+        lambda *_args, **_kwargs: storage_plan,
+    )
+    monkeypatch.setattr(
+        operator,
+        "list_storage_resources",
+        lambda _storage: object(),
+    )
+    monkeypatch.setattr(
+        operator,
+        "prepare_storage_upgrade",
+        lambda *_args: storage_plan,
     )
     monkeypatch.setattr(
         operator,
@@ -9621,6 +10137,7 @@ def test_watch_timeout_retries_nonempty_deletion_orphans(monkeypatch):
 def test_watch_stream_propagates_runtime_union_reconciliation_failure(
         monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
     added = {
         "metadata": {"name": "bellagio-vault", "resourceVersion": "122"},
@@ -9665,7 +10182,7 @@ def test_watch_stream_propagates_runtime_union_reconciliation_failure(
 
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         reconcile_union,
         raising=False,
     )
@@ -9681,6 +10198,7 @@ def test_watch_stream_propagates_runtime_union_reconciliation_failure(
 
 def test_watch_stream_raises_expired_error_object_for_safe_relist(monkeypatch):
     operator = _load_operator(monkeypatch)
+    _assume_current_nodeplugin(monkeypatch, operator)
     k8s_client = object()
 
     class CustomObjectsClient:
@@ -9712,7 +10230,7 @@ def test_watch_stream_raises_expired_error_object_for_safe_relist(monkeypatch):
     monkeypatch.setattr(operator.watch, "Watch", FakeWatch, raising=False)
     monkeypatch.setattr(
         operator,
-        "reconcile_nodeplugin_from_storage",
+        "prepare_watch_storage_snapshot",
         lambda *_args, **_kwargs: _storage_plan(resource_version="999"),
     )
     monkeypatch.setattr(
