@@ -18,3 +18,7 @@ global:
 operator:
   enabled: false
   verbose: 'no'
+  # Covers the default 120s CSI quiesce, 3600s nodeplugin rollout, and 300s
+  # provisioner handoff windows, plus 180s of API/control-loop margin. The
+  # Helm or GitOps action timeout must be longer than this deadline.
+  progressDeadlineSeconds: 4200

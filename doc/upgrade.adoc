@@ -30,22 +30,22 @@ kubectl apply -f kadalu-operator.yaml
 The operator owns the CSI node and controller workloads. A separate
 `csi-nodeplugin.yaml` release asset is not used.
 
-== Upgrade the controller workloads
-
-Wait for the operator and CSI controller workload to finish rolling out:
-
-[source,console]
-----
-kubectl -n kadalu rollout status deployment/operator
-kubectl -n kadalu rollout status statefulset/kadalu-csi-provisioner
-kubectl -n kadalu get pods
-----
-
 == Upgrade node plugins safely
 
 The node plugin intentionally uses the `OnDelete` update strategy. Replacing a
 node-plugin pod also terminates the Gluster FUSE clients running in that pod,
 so do not delete every node-plugin pod at once.
+
+The operator intentionally remains unready and quiesces the CSI provisioner
+until every desired node-plugin pod matches the new DaemonSet template. Start
+the node-plugin rotation after the DaemonSet template has the expected image;
+do not wait for the operator rollout first.
+
+[source,console]
+----
+kubectl -n kadalu get daemonset kadalu-csi-nodeplugin \
+  -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+----
 
 Upgrade one node at a time during a maintenance window:
 
@@ -68,3 +68,15 @@ kubectl uncordon <node>
 
 Choose drain flags appropriate for the cluster. Stop and investigate any mount
 or workload failure before continuing to another node.
+
+== Verify the controller workloads
+
+After every desired node-plugin pod uses the new template and is Ready, wait
+for the operator to resume the CSI provisioner and finish its rollout:
+
+[source,console]
+----
+kubectl -n kadalu rollout status deployment/operator --timeout=75m
+kubectl -n kadalu rollout status statefulset/kadalu-csi-provisioner --timeout=5m
+kubectl -n kadalu get pods
+----
