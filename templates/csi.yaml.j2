@@ -30,6 +30,38 @@ spec:
       namespace: {{ namespace }}
     spec:
       serviceAccountName: kadalu-csi-nodeplugin
+{% if nodeplugin_tolerations %}
+      tolerations:
+{% for toleration in nodeplugin_tolerations %}
+{% set has_key = "key" in toleration and toleration["key"] is not none %}
+{% set has_operator = "operator" in toleration and toleration["operator"] is not none %}
+{% set has_value = "value" in toleration and toleration["value"] is not none %}
+{% set has_effect = "effect" in toleration and toleration["effect"] is not none %}
+{% set has_seconds = "tolerationSeconds" in toleration and toleration["tolerationSeconds"] is not none %}
+{% if has_key or has_operator or has_value or has_effect or has_seconds %}
+        -
+{% if has_key %}
+          key: {{ toleration["key"] | tojson }}
+{% endif %}
+{% if has_operator %}
+          operator: {{ toleration["operator"] | tojson }}
+{% endif %}
+{% if has_value %}
+          value: {{ toleration["value"] | tojson }}
+{% endif %}
+{% if has_effect %}
+          effect: {{ toleration["effect"] | tojson }}
+{% endif %}
+{% if has_seconds %}
+          tolerationSeconds: {{ toleration["tolerationSeconds"] | tojson }}
+{% endif %}
+{% else %}
+        - {}
+{% endif %}
+{% endfor %}
+{% else %}
+      tolerations: []
+{% endif %}
       containers:
         - name: csi-node-driver-registrar
           image: {{ csi_sidecar_registry }}/sig-storage/csi-node-driver-registrar:v2.17.0@sha256:f9de845b170155199f2a2a3f9531cf13d78e31235e9db6b6582a8b0db0a50dad
@@ -236,6 +268,18 @@ spec:
             - name: driver-health
               containerPort: 9809
               protocol: TCP
+          # Mount reconciliation runs behind the live CSI socket so one bad
+          # pool cannot take healthy pools offline. This readiness-only marker
+          # reports the degraded state without restarting the controller.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /plugin/storage-ready
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 1
           livenessProbe:
             httpGet:
               path: /healthz
@@ -323,6 +367,17 @@ spec:
           args:
             - "--csi-address=/plugin/csi.sock"
             - "--http-endpoint=:9809"
+          # Pod readiness requires both this live CSI socket and the separate
+          # hosting-volume marker on the driver container. Mount degradation
+          # never feeds the liveness probe or restarts the controller.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9809
+            initialDelaySeconds: 10
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 1
           volumeMounts:
             - name: socket-dir
               mountPath: /plugin

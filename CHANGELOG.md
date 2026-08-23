@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- CSI: Continuously reconcile provisioner hosting-volume mounts and report the
+  controller pod unready while any required mount is unavailable without
+  stopping service for healthy pools; fresh provisioning skips unavailable or
+  deletion-fenced pools while identity lookup and pending retries remain
+  fail-closed and idempotent.
+- CSI: Repair stale filesystem and block publish targets after a safe backend
+  configuration revision when the stable pool UUID and all volume, path, and
+  node-owned sidecar evidence still match.
+- Operator: Keep the provisioner fenced through server upgrades and reconcile
+  brick StatefulSets one at a time, waiting for each desired revision to become
+  Ready and Available before advancing, while preserving the authoritative
+  Kadalustorage tolerations for legacy pool records.
+- Operator: Preflight replicated-pool heal state, quarantine unsafe stored or
+  requested identities, use non-overlapping operator rollouts, and protect
+  cluster-scoped StorageClasses with explicit pool ownership metadata.
+- Operator: Tombstone deleting pools under a CSI fence, count every attributable
+  PersistentVolume before teardown, keep nonempty cleanup retries pool-local,
+  and re-fence and re-count before final removal so pending create intents cannot
+  race server or metadata deletion; safely seal or quarantine UID-less legacy
+  deletion orphans without allowing same-name CR adoption or repeatedly fencing
+  unrelated provisioning.
+- Operator: Report Ready only after storage reconciliation succeeds and the CSI
+  provisioner reaches its current revision; clear readiness while reconciliation
+  is in progress or the operator child is restarting.
+- Operator: Fence provisioning across live reclaim-policy transitions, verify
+  the pool record, StorageClass, and attributable PersistentVolumes under that
+  fence, and remain fenced when reconciliation cannot prove a consistent state.
+- Operator: Allow native and External pools to select an immutable
+  `spec.storageClassName`, while retaining `kadalu.<pool>` as the default name
+  and preserving ownership, recovery, deletion, and reclaim-policy safety.
 - Builder, GlusterFS: Preserve namespace markers during replica metadata heal so
   namespace-protected PVC roots do not remain pending after a brick outage.
 - CSI: Restore quota namespace markers only after the corresponding EPERM;

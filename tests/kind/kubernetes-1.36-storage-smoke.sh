@@ -95,6 +95,8 @@ metadata:
   name: bellagio-vault
 spec:
   type: Replica1
+  storageClassName: bellagio-vault-class
+  pvReclaimPolicy: retain
   storage:
     - node: ${KIND_CLUSTER_NAME}-control-plane
       path: /var/lib/kadalu-ci/bellagio-brick
@@ -112,6 +114,19 @@ kubectl wait -n "${KADALU_NAMESPACE}" --for=condition=Ready \
   pod -l app.kubernetes.io/name=kadalu-csi-nodeplugin --timeout=300s
 kubectl rollout status -n "${KADALU_NAMESPACE}" \
   statefulset/server-bellagio-vault-0 --timeout=300s
+kubectl wait --for=create storageclass/bellagio-vault-class --timeout=120s
+test "$(kubectl get storageclass bellagio-vault-class \
+  -o jsonpath='{.provisioner}')" = "kadalu"
+test "$(kubectl get storageclass bellagio-vault-class \
+  -o jsonpath='{.reclaimPolicy}')" = "Retain"
+if kubectl get storageclass kadalu.bellagio-vault >/dev/null 2>&1; then
+  echo "Unexpected legacy StorageClass was created" >&2
+  exit 1
+fi
+test -z "$(kubectl get storageclass bellagio-vault-class \
+  -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}')"
+test -z "$(kubectl get storageclass bellagio-vault-class \
+  -o jsonpath='{.metadata.annotations.storageclass\.beta\.kubernetes\.io/is-default-class}')"
 
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -121,7 +136,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany
-  storageClassName: kadalu.bellagio-vault
+  storageClassName: bellagio-vault-class
   resources:
     requests:
       storage: 20Mi
@@ -186,6 +201,10 @@ kubectl exec rusty-ryan-reader -- \
 pv_name="$(kubectl get pvc bellagio-loot -o jsonpath='{.spec.volumeName}')"
 kubectl delete pod rusty-ryan-reader --wait=true --timeout=180s
 kubectl delete pvc bellagio-loot --wait=true --timeout=180s
-kubectl wait --for=delete "persistentvolume/${pv_name}" --timeout=300s
+kubectl wait --for=jsonpath='{.status.phase}'=Released \
+  "persistentvolume/${pv_name}" --timeout=300s
+test "$(kubectl get "persistentvolume/${pv_name}" \
+  -o jsonpath='{.spec.persistentVolumeReclaimPolicy}')" = "Retain"
+kubectl delete "persistentvolume/${pv_name}" --wait=true --timeout=180s
 
-echo "Kubernetes 1.36 provision, mount, remount, expand, and delete passed"
+echo "Kubernetes 1.36 provision, mount, remount, expand, and retain passed"

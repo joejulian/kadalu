@@ -52,8 +52,12 @@ def runtime_manifests():
                     "key": "crew",
                     "operator": "Equal",
                     "value": "ocean",
-                    "effect": "NoSchedule",
-                }
+                    "effect": "NoExecute",
+                    "tolerationSeconds": 0,
+                },
+                {
+                    "operator": "Exists",
+                },
             ],
             kube_hostname="linus-caldwell",
             shd_required=False,
@@ -68,13 +72,25 @@ def runtime_manifests():
         ),
         render(
             "storageclass-kadalu.custom.yaml.j2",
+            namespace=NAMESPACE,
             hostvol_name="bellagio-vault",
+            storage_class_name="kadalu.bellagio-vault",
+            storage_uid="uid-bellagio-vault",
+            volume_id="00000000-0000-4000-8000-000000000001",
+            mount_identity="00000000-0000-4000-8000-000000000002",
+            backend_fingerprint="1" * 64,
             single_pv_per_pool=False,
             reclaim_policy="Delete",
         ),
         render(
             "external-storageclass.yaml.j2",
+            namespace=NAMESPACE,
             volname="mirage-vault",
+            storage_class_name="kadalu.mirage-vault",
+            storage_uid="uid-mirage-vault",
+            volume_id="00000000-0000-4000-8000-000000000003",
+            mount_identity="00000000-0000-4000-8000-000000000004",
+            backend_fingerprint="2" * 64,
             gluster_hosts="gluster.example.invalid",
             gluster_volname="mirage",
             gluster_options="log-level=WARNING",
@@ -96,6 +112,18 @@ def runtime_manifests():
                 "docker.io/library/busybox:1.37.0@sha256:"
                 "9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"
             ),
+            nodeplugin_tolerations=[
+                {
+                    "key": "crew",
+                    "operator": "Equal",
+                    "value": "ocean",
+                    "effect": "NoExecute",
+                    "tolerationSeconds": 0,
+                },
+                {
+                    "operator": "Exists",
+                },
+            ],
         ),
     ]
 

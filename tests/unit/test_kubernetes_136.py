@@ -37,7 +37,8 @@ SIDECAR_IMAGES = {
 }
 
 
-def _render_csi_documents(provisioner_replicas=None):
+def _render_csi_documents(
+        provisioner_replicas=None, nodeplugin_tolerations=None):
     template = Template(
         (ROOT / "templates/csi.yaml.j2").read_text(encoding="utf-8")
     )
@@ -51,11 +52,45 @@ def _render_csi_documents(provisioner_replicas=None):
         "verbose": "no",
         "csi_sidecar_registry": "registry.k8s.io",
         "busybox_image": BUSYBOX_IMAGE,
+        "nodeplugin_tolerations": (
+            []
+            if nodeplugin_tolerations is None
+            else nodeplugin_tolerations
+        ),
     }
     if provisioner_replicas is not None:
         values["provisioner_replicas"] = provisioner_replicas
     rendered = template.render(**values)
     return [document for document in yaml.safe_load_all(rendered) if document]
+
+
+def _render_server(tolerations):
+    template = Template(
+        (ROOT / "templates" / "server.yaml.j2").read_text(encoding="utf-8")
+    )
+    rendered = template.render(
+        namespace="the-vault",
+        serverpod_name="server-bellagio-vault-0",
+        volname="bellagio-vault",
+        voltype="Replica1",
+        images_hub="registry.example.invalid",
+        docker_user="ocean-crew",
+        kadalu_version="test",
+        k8s_dist="kubernetes",
+        verbose="no",
+        tolerations=tolerations,
+        kube_hostname="linus-caldwell",
+        shd_required=False,
+        brick_path="/bricks/bellagio-vault/data/brick",
+        brick_node_id="linus-caldwell",
+        volume_id="00000000-0000-4000-8000-000000000001",
+        brick_index=0,
+        brick_device="",
+        pvc_name="",
+        host_brick_path="/tmp/kadalu-ci/brick0",
+        brick_device_dir="",
+    )
+    return yaml.safe_load(rendered)
 
 
 def _helm_documents():
@@ -81,6 +116,125 @@ def _helm_documents():
     return [document for document in yaml.safe_load_all(rendered) if document]
 
 
+def test_storage_crd_declares_custom_storage_class_name():
+    crd = yaml.safe_load((
+        ROOT
+        / "helm/kadalu/charts/operator/crds/kadalu_storage.yaml"
+    ).read_text(encoding="utf-8"))
+    storage_class = (
+        crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+        ["properties"]["spec"]["properties"]["storageClassName"]
+    )
+
+    assert storage_class["type"] == "string"
+    assert storage_class["minLength"] == 1
+    assert storage_class["maxLength"] == 253
+    assert "pattern" in storage_class
+    assert "(?" not in storage_class["pattern"]
+    assert "immutable" in storage_class["description"].lower()
+
+
+def test_server_tolerations_preserve_supported_fields_as_typed_yaml():
+    tolerations = [
+        {"operator": "Exists"},
+        {
+            "key": "yes",
+            "operator": "Equal",
+            "value": "null",
+            "effect": "NoExecute",
+            "tolerationSeconds": 0,
+        },
+        {
+            "key": "mirage-any-effect",
+            "operator": "Exists",
+            "effect": "",
+        },
+        {"key": "bellagio-default-operator", "value": "crew"},
+    ]
+
+    server = _render_server(tolerations)
+
+    assert server["spec"]["template"]["spec"]["tolerations"] == [
+        {"operator": "Exists"},
+        {
+            "key": "yes",
+            "operator": "Equal",
+            "value": "null",
+            "effect": "NoExecute",
+            "tolerationSeconds": 0,
+        },
+        {
+            "key": "mirage-any-effect",
+            "operator": "Exists",
+            "effect": "",
+        },
+        {"key": "bellagio-default-operator", "value": "crew"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "provisioner_replicas",
+    [0, 1],
+    ids=["fenced", "serving"],
+)
+def test_csi_nodeplugin_tolerations_render_losslessly(
+        provisioner_replicas):
+    tolerations = [
+        {"operator": "Exists"},
+        {
+            "key": "yes",
+            "operator": "Equal",
+            "value": "null",
+            "effect": "NoExecute",
+            "tolerationSeconds": 0,
+        },
+        {
+            "key": "mirage-any-effect",
+            "operator": "Exists",
+            "effect": "",
+        },
+        {"key": "bellagio-default-operator", "value": "crew"},
+    ]
+
+    nodeplugin = next(
+        document
+        for document in _render_csi_documents(
+            provisioner_replicas=provisioner_replicas,
+            nodeplugin_tolerations=tolerations,
+        )
+        if document["kind"] == "DaemonSet"
+        and document["metadata"]["name"] == "kadalu-csi-nodeplugin"
+    )
+
+    assert nodeplugin["spec"]["template"]["spec"]["tolerations"] == [
+        {"operator": "Exists"},
+        {
+            "key": "yes",
+            "operator": "Equal",
+            "value": "null",
+            "effect": "NoExecute",
+            "tolerationSeconds": 0,
+        },
+        {
+            "key": "mirage-any-effect",
+            "operator": "Exists",
+            "effect": "",
+        },
+        {"key": "bellagio-default-operator", "value": "crew"},
+    ]
+
+
+def test_csi_nodeplugin_renders_explicit_empty_toleration_list():
+    nodeplugin = next(
+        document
+        for document in _render_csi_documents(nodeplugin_tolerations=[])
+        if document["kind"] == "DaemonSet"
+        and document["metadata"]["name"] == "kadalu-csi-nodeplugin"
+    )
+
+    assert nodeplugin["spec"]["template"]["spec"]["tolerations"] == []
+
+
 def test_operator_can_patch_persistent_volume_reclaim_policy():
     operator_role = next(
         document
@@ -96,6 +250,69 @@ def test_operator_can_patch_persistent_volume_reclaim_policy():
     )
 
     assert "patch" in persistent_volume_rule["verbs"]
+
+
+def test_operator_can_list_server_statefulsets_for_identity_recovery():
+    operator_role = next(
+        document
+        for document in _helm_documents()
+        if document.get("kind") == "Role"
+        and document.get("metadata", {}).get("name") == "kadalu-operator"
+    )
+    statefulset_rule = next(
+        rule
+        for rule in operator_role["rules"]
+        if rule.get("apiGroups") == ["apps"]
+        and "statefulsets" in rule.get("resources", [])
+    )
+
+    assert "list" in statefulset_rule["verbs"]
+
+
+def test_operator_upgrade_avoids_normal_rolling_overlap():
+    operator = next(
+        document
+        for document in _helm_documents()
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "operator"
+    )
+
+    assert operator["spec"]["replicas"] == 1
+    assert operator["spec"]["strategy"] == {
+        "type": "RollingUpdate",
+        "rollingUpdate": {
+            "maxSurge": 0,
+            "maxUnavailable": 1,
+        },
+    }
+
+
+def test_operator_readiness_tracks_the_reconciler_process():
+    operator = next(
+        document
+        for document in _helm_documents()
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "operator"
+    )
+    container = next(
+        item
+        for item in operator["spec"]["template"]["spec"]["containers"]
+        if item["name"] == "kadalu-operator"
+    )
+
+    assert container["readinessProbe"] == {
+        "exec": {
+            "command": [
+                "/bin/sh",
+                "-c",
+                "test -f /tmp/operator-ready",
+            ],
+        },
+        "timeoutSeconds": 3,
+        "periodSeconds": 5,
+        "failureThreshold": 1,
+    }
+    assert "livenessProbe" not in container
 
 
 def test_fork_images_default_to_ghcr_namespace():
@@ -222,6 +439,35 @@ def test_controller_sidecars_have_leader_election_health_checks():
         )
 
 
+def test_controller_readiness_requires_storage_and_live_csi_socket():
+    provisioner = next(
+        document
+        for document in _render_csi_documents()
+        if document["metadata"]["name"] == "kadalu-csi-provisioner"
+    )
+    containers = {
+        container["name"]: container
+        for container in provisioner["spec"]["template"]["spec"]["containers"]
+    }
+    driver = containers["kadalu-provisioner"]
+    health_probe = containers["csi-liveness-probe"]
+
+    assert driver["readinessProbe"]["exec"]["command"] == [
+        "/bin/sh",
+        "-c",
+        "test -f /plugin/storage-ready",
+    ]
+    assert health_probe["readinessProbe"]["httpGet"] == {
+        "path": "/healthz",
+        "port": 9809,
+    }
+    assert driver["livenessProbe"]["httpGet"] == {
+        "path": "/healthz",
+        "port": "driver-health",
+    }
+    assert "startupProbe" not in driver
+
+
 @pytest.mark.parametrize(
     ("requested", "expected"),
     [(None, 1), (0, 0), (1, 1), (2, 1)],
@@ -289,6 +535,12 @@ def test_nodeplugin_receives_the_same_kubelet_root_it_mounts():
             "storageclass-kadalu.custom.yaml.j2",
             {
                 "hostvol_name": "bellagio-vault",
+                "storage_class_name": "default",
+                "namespace": "kadalu",
+                "storage_uid": "uid-bellagio-vault",
+                "volume_id": "00000000-0000-4000-8000-000000000001",
+                "mount_identity": "00000000-0000-4000-8000-000000000002",
+                "backend_fingerprint": "1" * 64,
                 "single_pv_per_pool": False,
             },
         ),
@@ -296,6 +548,12 @@ def test_nodeplugin_receives_the_same_kubelet_root_it_mounts():
             "external-storageclass.yaml.j2",
             {
                 "volname": "mirage-vault",
+                "storage_class_name": "mirage-vault-class",
+                "namespace": "kadalu",
+                "storage_uid": "uid-mirage-vault",
+                "volume_id": "00000000-0000-4000-8000-000000000003",
+                "mount_identity": "00000000-0000-4000-8000-000000000004",
+                "backend_fingerprint": "2" * 64,
                 "gluster_hosts": "gluster.example.invalid",
                 "gluster_volname": "mirage",
                 "gluster_options": "",
@@ -316,7 +574,26 @@ def test_storage_class_templates_render_explicit_reclaim_policy(
         reclaim_policy=reclaim_policy,
     ))
 
+    assert storage_class["metadata"]["name"] == values["storage_class_name"]
     assert storage_class["reclaimPolicy"] == reclaim_policy
+    assert storage_class["metadata"]["annotations"] == {
+        "kadalu.io/storage-namespace": "kadalu",
+        "kadalu.io/storage-name": (
+            values.get("hostvol_name") or values["volname"]
+        ),
+        "kadalu.io/storage-uid": values["storage_uid"],
+        "kadalu.io/volume-id": values["volume_id"],
+        "kadalu.io/mount-identity": values["mount_identity"],
+        "kadalu.io/backend-fingerprint": values["backend_fingerprint"],
+    }
+    assert (
+        "storageclass.kubernetes.io/is-default-class"
+        not in storage_class["metadata"]["annotations"]
+    )
+    assert (
+        "storageclass.beta.kubernetes.io/is-default-class"
+        not in storage_class["metadata"]["annotations"]
+    )
 
 
 def test_node_health_check_never_restarts_fuse_owner():

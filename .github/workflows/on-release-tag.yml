@@ -89,6 +89,17 @@ jobs:
           make pypi-build
           python -m twine check server/dist/*
 
+          # A published installer must keep installing the release it belongs
+          # to. Leaving GitHub's `latest` redirect in a prerelease asset would
+          # install the previous stable version, and old assets would change
+          # behavior whenever a newer stable release is published.
+          sed --in-place \
+            "s|releases/latest/download|releases/download/${KADALU_VERSION}|" \
+            extras/install.sh
+          grep --fixed-strings \
+            "releases/download/${KADALU_VERSION}/kubectl-kadalu" \
+            extras/install.sh
+
           shopt -s nullglob
           release_files=(
             manifests/*.yaml

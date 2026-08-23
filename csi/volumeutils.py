@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import stat
 import threading
 import time
@@ -90,6 +91,35 @@ class VolumeOperationLockTimeoutError(TimeoutError):
 
 class VolumeOperationConflictError(ValueError):
     """Raised when a volume changes while a lifecycle lock is acquired."""
+
+
+class HostingVolumeReconciliationError(ValueError):
+    """Raised when one pool cannot provide trustworthy capacity state."""
+
+
+class HostingVolumeSelectionError(CommandException):
+    """Raised when failed checks prevent a definitive capacity result."""
+
+    def __init__(self, failures):
+        self.failures = tuple(failures)
+        details = "; ".join(
+            f"{hostvol}: {error}"
+            for hostvol, error in self.failures
+        )
+        return_code = (
+            124
+            if self.failures and all(
+                isinstance(error, CommandException) and error.ret == 124
+                for _hostvol, error in self.failures
+            )
+            else -1
+        )
+        super().__init__(
+            return_code,
+            "mount_and_select_hosting_volume",
+            "No hosting volume could satisfy the request while availability "
+            f"checks failed: {details}",
+        )
 
 
 class Volume():
@@ -187,6 +217,15 @@ def filter_supported_pvtype(volume, filters):
     return volume
 
 
+def new_volume_hosting_candidates(volumes):
+    """Exclude operator-fenced pools only from fresh volume placement."""
+    return [
+        volume
+        for volume in volumes
+        if volume.get("provisioning_disabled") is not True
+    ]
+
+
 # Disabled pylint here because filters argument is used as
 # readonly in all functions
 # noqa # pylint: disable=dangerous-default-value
@@ -202,7 +241,7 @@ def get_pv_hosting_volumes(filters={}, iteration=40):
     for filename in os.listdir(VOLINFO_DIR):
         if filename.endswith(".info"):
             total_volumes += 1
-            volname = filename.replace(".info", "")
+            volname = filename.removesuffix(".info")
 
             filtered = filter_storage_name({"volname": volname}, filters)
             if filtered is None:
@@ -362,6 +401,31 @@ def _mount_identity(volume):
 def mount_identity_token(volume):
     """Return the validated mount identity exposed to publish recovery."""
     return _mount_identity(volume)
+
+
+def _mount_identity_generation(identity):
+    """Return the stable UUID from one validated UUID-fingerprint token."""
+    if not isinstance(identity, str):
+        return None
+    generation, separator, fingerprint = identity.rpartition("-")
+    if (
+            not separator
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None):
+        return None
+    try:
+        canonical_generation = str(uuid.UUID(generation))
+    except ValueError:
+        return None
+    return canonical_generation if generation == canonical_generation else None
+
+
+def _same_mount_identity_generation(first, second):
+    """Return whether exact mount tokens share one stable pool generation."""
+    first_generation = _mount_identity_generation(first)
+    return (
+        first_generation is not None
+        and first_generation == _mount_identity_generation(second)
+    )
 
 
 def legacy_mount_fallback_authorized(volume):
@@ -1196,6 +1260,54 @@ def _rebuild_committed_capacity(accounting, hostvol_mnt):
             accounting.update_pv_record(volume_id, size)
 
 
+def _reconcile_hosting_volume_capacity(accounting, hostvol_mnt, total_size):
+    """Rebuild one pool's capacity index or mark that pool unavailable."""
+    try:
+        accounting.update_summary(total_size)
+        _rebuild_committed_capacity(accounting, hostvol_mnt)
+    except (OSError, sqlite3.Error, ValueError) as err:
+        raise HostingVolumeReconciliationError(str(err)) from err
+
+
+def _hosting_volume_capacity_stats(accounting):
+    """Read validated pool capacity or mark that pool unavailable."""
+    try:
+        return accounting.get_stats()
+    except (sqlite3.Error, ValueError) as err:
+        raise HostingVolumeReconciliationError(str(err)) from err
+
+
+@contextmanager
+def _selection_size_accounting(hostvol, hostvol_mnt):
+    """Open capacity accounting while classifying pool-local open failures."""
+    accounting = SizeAccounting(hostvol, hostvol_mnt)
+    entered = False
+    try:
+        with accounting as opened_accounting:
+            entered = True
+            yield opened_accounting
+    except sqlite3.Error as err:
+        if entered:
+            raise
+        if accounting.conn is not None:
+            accounting.conn.close()
+        raise HostingVolumeReconciliationError(str(err)) from err
+
+
+@contextmanager
+def _selection_capacity_transaction(accounting):
+    """Begin admission while classifying a pre-mutation SQLite lock failure."""
+    entered = False
+    try:
+        with accounting.immediate_transaction():
+            entered = True
+            yield
+    except sqlite3.Error as err:
+        if entered:
+            raise
+        raise HostingVolumeReconciliationError(str(err)) from err
+
+
 def release_archived_pv_reservation(
         hostvol, archived_name, original_volume_id=None):
     """Release an archive while preserving any recreated active volume."""
@@ -1217,8 +1329,11 @@ def _admit_volume_creation(
         accounting, hostvol_mnt, total_size, creation):
     """Atomically check capacity and persist one create reservation."""
     volume_id, pvtype, required_size = creation
-    accounting.update_summary(total_size)
-    _rebuild_committed_capacity(accounting, hostvol_mnt)
+    _reconcile_hosting_volume_capacity(
+        accounting,
+        hostvol_mnt,
+        total_size,
+    )
 
     volpath = get_volume_path(
         pvtype,
@@ -1252,7 +1367,7 @@ def _admit_volume_creation(
             "Volume capacity is reserved without a matching creation intent"
         )
 
-    pv_stats = accounting.get_stats()
+    pv_stats = _hosting_volume_capacity_stats(accounting)
     reserved_size = (
         pv_stats["free_size_bytes"] * RESERVED_SIZE_PERCENTAGE / 100
     )
@@ -1277,6 +1392,7 @@ def mount_and_select_hosting_volume(
     """Mount each hosting volume to find available space"""
     if (volume_id is None) != (pvtype is None):
         raise ValueError("Creation admission requires both volume ID and PV type")
+    failures = []
     for volume in pv_hosting_volumes:
         if get_single_pv_per_pool(volume):
             logging.warning(logf(
@@ -1286,31 +1402,71 @@ def mount_and_select_hosting_volume(
             continue
         hvol = volume['name']
         mntdir = os.path.join(HOSTVOL_MOUNTDIR, hvol)
-        mount_glusterfs(volume, mntdir)
+        try:
+            mount_glusterfs(volume, mntdir)
+        except (CommandException, OSError, ValueError) as err:
+            failures.append((hvol, err))
+            logging.warning(logf(
+                "Skipping unavailable hosting volume",
+                hostvol=hvol,
+                stage="mount",
+                error=err,
+            ))
+            continue
 
         with statfile_lock:
             # Stat done before `os.path.exists` to prevent ignoring
             # file not exists even in case of ENOTCONN
-            mntdir_stat = retry_errors(os.statvfs, [mntdir], [ENOTCONN])
-            with SizeAccounting(hvol, mntdir) as acc:
-                total_size = mntdir_stat.f_blocks * mntdir_stat.f_frsize
-                if volume_id is not None:
-                    with acc.immediate_transaction():
-                        if _admit_volume_creation(
-                                acc,
-                                mntdir,
-                                total_size,
-                                (volume_id, pvtype, required_size)):
-                            return hvol
-                    continue
-
-                acc.update_summary(total_size)
-                _rebuild_committed_capacity(acc, mntdir)
-                pv_stats = acc.get_stats()
-                reserved_size = (
-                    pv_stats["free_size_bytes"]
-                    * RESERVED_SIZE_PERCENTAGE / 100
+            try:
+                mntdir_stat = retry_errors(
+                    os.statvfs,
+                    [mntdir],
+                    [ENOTCONN],
                 )
+            except OSError as err:
+                failures.append((hvol, err))
+                logging.warning(logf(
+                    "Skipping unavailable hosting volume",
+                    hostvol=hvol,
+                    stage="stat",
+                    error=err,
+                ))
+                continue
+
+            try:
+                with _selection_size_accounting(hvol, mntdir) as acc:
+                    total_size = (
+                        mntdir_stat.f_blocks * mntdir_stat.f_frsize
+                    )
+                    if volume_id is not None:
+                        with _selection_capacity_transaction(acc):
+                            if _admit_volume_creation(
+                                    acc,
+                                    mntdir,
+                                    total_size,
+                                    (volume_id, pvtype, required_size)):
+                                return hvol
+                        continue
+
+                    _reconcile_hosting_volume_capacity(
+                        acc,
+                        mntdir,
+                        total_size,
+                    )
+                    pv_stats = _hosting_volume_capacity_stats(acc)
+                    reserved_size = (
+                        pv_stats["free_size_bytes"]
+                        * RESERVED_SIZE_PERCENTAGE / 100
+                    )
+            except HostingVolumeReconciliationError as err:
+                failures.append((hvol, err))
+                logging.warning(logf(
+                    "Skipping unavailable hosting volume",
+                    hostvol=hvol,
+                    stage="capacity-reconciliation",
+                    error=err,
+                ))
+                continue
 
             logging.debug(logf(
                 "pv stats",
@@ -1326,6 +1482,8 @@ def mount_and_select_hosting_volume(
             if required_size < (pv_stats["free_size_bytes"] - reserved_size):
                 return hvol
 
+    if failures:
+        raise HostingVolumeSelectionError(failures)
     return None
 
 
@@ -3262,7 +3420,8 @@ def _publish_state(
     }
 
 
-def _publish_state_matches(mountpoint, expected):
+def _publish_state_matches(
+        mountpoint, expected, allow_mount_config_revision=False):
     """Return whether a root-owned sidecar authorizes stale-target recovery."""
     if expected is None:
         return False
@@ -3272,9 +3431,29 @@ def _publish_state_matches(mountpoint, expected):
         if not stat.S_ISREG(path_stat.st_mode):
             return False
         with open(path, encoding="utf-8") as state_file:
-            return json.load(state_file) == expected
+            actual = json.load(state_file)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return False
+
+    if actual == expected:
+        return True
+    if (
+            not allow_mount_config_revision
+            or not isinstance(actual, dict)
+            or not isinstance(expected, dict)
+            or not _same_mount_identity_generation(
+                actual.get("host_mount_identity"),
+                expected.get("host_mount_identity"),
+            )):
+        return False
+
+    # Stable pool generation alone is insufficient. Every PV and target-path
+    # field must remain exact; only the configuration fingerprint may differ.
+    revision_adjusted = {
+        **actual,
+        "host_mount_identity": expected["host_mount_identity"],
+    }
+    return revision_adjusted == expected
 
 
 def _record_publish_state(mountpoint, state_data):
@@ -3485,7 +3664,17 @@ def _same_logical_stale_source(
                         and source == f"kadalu:{host_volume_name}"):
                     return False
             elif identity != host_mount_identity:
-                return False
+                if not (
+                        _same_mount_identity_generation(
+                            identity,
+                            host_mount_identity,
+                        )
+                        and _publish_state_matches(
+                            mountpoint,
+                            publish_state,
+                            allow_mount_config_revision=True,
+                        )):
+                    return False
         return True
 
     if re.fullmatch(r"/dev/loop\d+", source) is None:
@@ -3494,7 +3683,11 @@ def _same_logical_stale_source(
         # A loop device does not expose the identity of the Gluster client
         # which originally opened its backing file. After a host remount, only
         # the durable node-owned sidecar can prove this is the same logical PV.
-        return _publish_state_matches(mountpoint, publish_state)
+        return _publish_state_matches(
+            mountpoint,
+            publish_state,
+            allow_mount_config_revision=True,
+        )
     backing_path = _loop_backing_path(source)
     if backing_path is None:
         return False

@@ -259,6 +259,49 @@ def _set_existing_target(monkeypatch, env, *, same_source, samefile_error=None,
     monkeypatch.setattr(env.volumeutils, "execute", execute)
 
 
+def _set_stale_revision_target(
+        monkeypatch, env, pvtype, mount_identity, publish_state):
+    """Install one stale target and its node-owned heist identity sidecar."""
+    if pvtype == env.volumeutils.PV_TYPE_RAWBLOCK:
+        env.target.touch()
+        mount_source = "devtmpfs"
+        mount_root = "/loop53"
+        mount_fstype = "devtmpfs"
+    elif pvtype == env.volumeutils.PV_TYPE_VIRTBLOCK:
+        env.target.mkdir()
+        mount_source = "/dev/loop53"
+        mount_root = "/"
+        mount_fstype = "xfs"
+    else:
+        env.target.mkdir()
+        mount_source = f"kadalu:{POOL_NAME}:{mount_identity}"
+        mount_root = f"/{env.volume_path}"
+        mount_fstype = "fuse.glusterfs"
+
+    _write_mountinfo(
+        monkeypatch,
+        env.volumeutils,
+        env.target.parent / "mountinfo",
+        [{
+            "device": "7:53",
+            "root": mount_root,
+            "target": env.target,
+            "fstype": mount_fstype,
+            "source": mount_source,
+        }],
+    )
+    if publish_state is not None:
+        Path(env.volumeutils._publish_state_path(str(env.target))).write_text(
+            json.dumps(publish_state),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        env.volumeutils,
+        "_mounted_volume_source_matches",
+        lambda *_args, **_kwargs: False,
+    )
+
+
 @pytest.mark.parametrize("pvtype", ["subvol", "virtblock", "rawblock"])
 @pytest.mark.parametrize("same_source", [True, False])
 def test_existing_target_requires_the_exact_requested_volume(
@@ -804,6 +847,116 @@ def test_stale_block_target_recovers_from_node_owned_publish_identity(
     assert json.loads(Path(
         env.volumeutils._publish_state_path(str(env.target))
     ).read_text(encoding="utf-8")) == expected_state
+
+
+@pytest.mark.parametrize("pvtype", ["subvol", "virtblock", "rawblock"])
+def test_stale_target_recovers_across_same_pool_config_revision(
+        monkeypatch, tmp_path, pvtype):
+    env = _prepare_publish(monkeypatch, tmp_path, pvtype)
+    previous_identity = f"{MOUNT_GENERATION}-{'a' * 64}"
+    current_identity = f"{MOUNT_GENERATION}-{'b' * 64}"
+    previous_state = env.volumeutils._publish_state(
+        VOLUME_ID,
+        pvtype,
+        env.volume_path,
+        POOL_NAME,
+        previous_identity,
+    )
+    _set_stale_revision_target(
+        monkeypatch,
+        env,
+        pvtype,
+        previous_identity,
+        previous_state,
+    )
+    commands = []
+
+    def execute(*command):
+        commands.append(command)
+        if command[:3] == ("losetup", "-f", "--show"):
+            return "/dev/loop61", "", 101
+        if command[0] == "losetup" and "BACK-FILE" in command:
+            return "/proc/999999/fd/17", "", 102
+        return "", "", 102
+
+    monkeypatch.setattr(env.volumeutils, "execute", execute)
+
+    assert env.volumeutils.mount_volume(
+        str(env.source),
+        str(env.target),
+        pvtype,
+        fstype="xfs",
+        logical_source_path=str(env.source),
+        volume_path=env.volume_path,
+        host_volume_name=POOL_NAME,
+        host_mount_identity=current_identity,
+        volume_id=VOLUME_ID,
+    )
+
+    assert (env.volumeutils.UNMOUNT_CMD, "-l", str(env.target)) in commands
+    assert not any("BACK-FILE" in command for command in commands)
+    assert json.loads(Path(
+        env.volumeutils._publish_state_path(str(env.target))
+    ).read_text(encoding="utf-8")) == env.volumeutils._publish_state(
+        VOLUME_ID,
+        pvtype,
+        env.volume_path,
+        POOL_NAME,
+        current_identity,
+    )
+
+
+@pytest.mark.parametrize("pvtype", ["subvol", "virtblock"])
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    ["different-generation", "volume-id", "volume-path", "missing-sidecar"],
+)
+def test_config_revision_recovery_rejects_mismatched_publish_identity(
+        monkeypatch, tmp_path, pvtype, invalid_evidence):
+    env = _prepare_publish(monkeypatch, tmp_path, pvtype)
+    previous_generation = MOUNT_GENERATION
+    if invalid_evidence == "different-generation":
+        previous_generation = "87654321-4321-6789-9234-567812345678"
+    previous_identity = f"{previous_generation}-{'a' * 64}"
+    current_identity = f"{MOUNT_GENERATION}-{'b' * 64}"
+    previous_state = env.volumeutils._publish_state(
+        (
+            "pvc-terry-benedict-decoy"
+            if invalid_evidence == "volume-id"
+            else VOLUME_ID
+        ),
+        pvtype,
+        (
+            "subvol/benedict/decoy/the-mirage"
+            if invalid_evidence == "volume-path"
+            else env.volume_path
+        ),
+        POOL_NAME,
+        previous_identity,
+    )
+    if invalid_evidence == "missing-sidecar":
+        previous_state = None
+    _set_stale_revision_target(
+        monkeypatch,
+        env,
+        pvtype,
+        previous_identity,
+        previous_state,
+    )
+    monkeypatch.setattr(env.volumeutils, "execute", _fail_if_called)
+
+    with pytest.raises(env.volumeutils.MountTargetConflictError):
+        env.volumeutils.mount_volume(
+            str(env.source),
+            str(env.target),
+            pvtype,
+            fstype="xfs",
+            logical_source_path=str(env.source),
+            volume_path=env.volume_path,
+            host_volume_name=POOL_NAME,
+            host_mount_identity=current_identity,
+            volume_id=VOLUME_ID,
+        )
 
 
 def test_stale_block_target_without_publish_identity_fails_closed(

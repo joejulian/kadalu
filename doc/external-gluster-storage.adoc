@@ -7,7 +7,10 @@ server processes are not managed by kadalu operator.
 
 In both the ways please note `metadata.name` (let's say `e-vol`) in
 `kind: KadaluStorage` will create a StorageClass with name
-`kadalu.<volname>` (`volname` will be replaced with `e-vol`).
+`kadalu.<volname>` (`volname` will be replaced with `e-vol`) by default. Set
+`spec.storageClassName` on the `KadaluStorage` to choose a different immutable
+name. This does not mark the generated class as the cluster's default, even if
+the chosen name is `default`.
 
 == Cleanup for re-using external gluster volume
 

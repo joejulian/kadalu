@@ -266,6 +266,11 @@ def test_controller_storage_command_failures_are_retryable(
     server = controllerserver.ControllerServer()
     if rpc_name == "create":
         monkeypatch.setattr(controllerserver, "search_volume", fail_storage)
+        monkeypatch.setattr(
+            controllerserver,
+            "mount_and_select_hosting_volume",
+            _fail_if_called,
+        )
         handler = server.CreateVolume
         request = csi_pb2.CreateVolumeRequest(
             name="pvc-bellagio-command-failure",
@@ -926,6 +931,324 @@ def test_admission_rebuilds_missing_reservation_from_committed_metadata(
         assert admitted is False
     with volumeutils.SizeAccounting(pool, str(pool_mount)) as accounting:
         assert accounting.get_pv_size(name) == 800
+
+
+@pytest.mark.parametrize(
+    "failed_stage",
+    ["mount", "stat", "accounting-lock", "reconciliation"],
+)
+def test_create_selection_skips_one_unavailable_pool(
+        monkeypatch, tmp_path, failed_stage):
+    volumeutils, _controllerserver, _csi_pb2 = _load_csi(monkeypatch)
+    unavailable_pool = "bellagio-vault"
+    healthy_pool = "bank-of-spain-vault"
+    mount_root = tmp_path / "mnt"
+    for pool in (unavailable_pool, healthy_pool):
+        (mount_root / pool).mkdir(parents=True)
+
+    monkeypatch.setattr(volumeutils, "HOSTVOL_MOUNTDIR", str(mount_root))
+
+    def mount_volume(volume, mountpoint):
+        if failed_stage == "mount" and volume["name"] == unavailable_pool:
+            raise volumeutils.CommandException(
+                -1,
+                "glusterfs",
+                "the Bellagio vault is unreachable",
+            )
+        return mountpoint
+
+    def stat_volume(path):
+        if failed_stage == "stat" and Path(path).name == unavailable_pool:
+            raise OSError(errno.ENOTCONN, "the Bellagio tunnel collapsed")
+        return SimpleNamespace(f_blocks=1000, f_bsize=1, f_frsize=1)
+
+    rebuild_capacity = volumeutils._rebuild_committed_capacity
+    immediate_transaction = volumeutils.SizeAccounting.immediate_transaction
+
+    @contextmanager
+    def begin_capacity_transaction(accounting):
+        if (
+                failed_stage == "accounting-lock"
+                and accounting.volname == unavailable_pool):
+            raise volumeutils.sqlite3.OperationalError(
+                "the Bellagio bookkeeper still holds the ledger",
+            )
+        with immediate_transaction(accounting):
+            yield
+
+    def reconcile_capacity(accounting, mountpoint):
+        if (
+                failed_stage == "reconciliation"
+                and Path(mountpoint).name == unavailable_pool):
+            raise ValueError("the Bellagio ledger is corrupt")
+        return rebuild_capacity(accounting, mountpoint)
+
+    monkeypatch.setattr(volumeutils, "mount_glusterfs", mount_volume)
+    monkeypatch.setattr(volumeutils.os, "statvfs", stat_volume)
+    monkeypatch.setattr(
+        volumeutils,
+        "retry_errors",
+        lambda function, args, _errors: function(*args),
+    )
+    monkeypatch.setattr(
+        volumeutils.SizeAccounting,
+        "immediate_transaction",
+        begin_capacity_transaction,
+    )
+    monkeypatch.setattr(
+        volumeutils,
+        "_rebuild_committed_capacity",
+        reconcile_capacity,
+    )
+
+    selected = volumeutils.mount_and_select_hosting_volume(
+        [
+            {"name": unavailable_pool, "type": "Replica1"},
+            {"name": healthy_pool, "type": "Replica1"},
+        ],
+        100,
+        volume_id="pvc-danny-ocean",
+        pvtype=volumeutils.PV_TYPE_SUBVOL,
+    )
+
+    assert selected == healthy_pool
+
+
+def test_create_selection_aggregates_failures_when_every_pool_is_unavailable(
+        monkeypatch, tmp_path):
+    volumeutils, _controllerserver, _csi_pb2 = _load_csi(monkeypatch)
+    mount_root = tmp_path / "mnt"
+    pools = ("bellagio-vault", "bank-of-spain-vault")
+    for pool in pools:
+        (mount_root / pool).mkdir(parents=True)
+
+    monkeypatch.setattr(volumeutils, "HOSTVOL_MOUNTDIR", str(mount_root))
+
+    def fail_mount(volume, _mountpoint):
+        raise volumeutils.CommandException(
+            -1,
+            "glusterfs",
+            f"{volume['name']} crew cannot reach the vault",
+        )
+
+    monkeypatch.setattr(volumeutils, "mount_glusterfs", fail_mount)
+
+    with pytest.raises(
+            volumeutils.HostingVolumeSelectionError) as raised:
+        volumeutils.mount_and_select_hosting_volume(
+            [
+                {"name": pool, "type": "Replica1"}
+                for pool in pools
+            ],
+            100,
+            volume_id="pvc-rusty-ryan",
+            pvtype=volumeutils.PV_TYPE_SUBVOL,
+        )
+
+    assert [name for name, _error in raised.value.failures] == list(pools)
+    for pool in pools:
+        assert pool in str(raised.value)
+        assert f"{pool} crew cannot reach the vault" in str(raised.value)
+
+
+def test_create_selection_reports_unavailable_when_remaining_pool_is_full(
+        monkeypatch, tmp_path):
+    volumeutils, _controllerserver, _csi_pb2 = _load_csi(monkeypatch)
+    unavailable_pool = "bellagio-vault"
+    full_pool = "bank-of-spain-vault"
+    mount_root = tmp_path / "mnt"
+    for pool in (unavailable_pool, full_pool):
+        (mount_root / pool).mkdir(parents=True)
+
+    monkeypatch.setattr(volumeutils, "HOSTVOL_MOUNTDIR", str(mount_root))
+
+    def mount_volume(volume, mountpoint):
+        if volume["name"] == unavailable_pool:
+            raise volumeutils.CommandException(
+                -1,
+                "glusterfs",
+                "the Bellagio vault is unreachable",
+            )
+        return mountpoint
+
+    monkeypatch.setattr(volumeutils, "mount_glusterfs", mount_volume)
+    monkeypatch.setattr(
+        volumeutils.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(
+            f_blocks=1000,
+            f_bsize=1,
+            f_frsize=1,
+        ),
+    )
+
+    with pytest.raises(
+            volumeutils.HostingVolumeSelectionError) as raised:
+        volumeutils.mount_and_select_hosting_volume(
+            [
+                {"name": unavailable_pool, "type": "Replica1"},
+                {"name": full_pool, "type": "Replica1"},
+            ],
+            950,
+            volume_id="pvc-linus-caldwell",
+            pvtype=volumeutils.PV_TYPE_SUBVOL,
+        )
+
+    assert [name for name, _error in raised.value.failures] == [
+        unavailable_pool,
+    ]
+
+
+def test_new_volume_candidates_exclude_only_explicitly_disabled_pools(
+        monkeypatch):
+    volumeutils, _controllerserver, _csi_pb2 = _load_csi(monkeypatch)
+    volumes = [
+        {
+            "name": "bellagio-vault",
+            "type": "Replica1",
+            "provisioning_disabled": True,
+        },
+        {
+            "name": "bank-of-spain-vault",
+            "type": "Replica1",
+            "provisioning_disabled": False,
+        },
+        {
+            "name": "the-bank-job-vault",
+            "type": "Replica1",
+        },
+    ]
+
+    assert [
+        volume["name"]
+        for volume in volumeutils.new_volume_hosting_candidates(volumes)
+    ] == ["bank-of-spain-vault", "the-bank-job-vault"]
+    assert [volume["name"] for volume in volumes] == [
+        "bellagio-vault",
+        "bank-of-spain-vault",
+        "the-bank-job-vault",
+    ]
+
+
+def test_general_pool_discovery_keeps_provisioning_disabled_pool(
+        monkeypatch, tmp_path):
+    volumeutils, _controllerserver, _csi_pb2 = _load_csi(monkeypatch)
+    pool = "bellagio-vault"
+    (tmp_path / f"{pool}.info").write_text(
+        json.dumps({
+            "bricks": [],
+            "provisioning_disabled": True,
+            "type": "Replica1",
+            "volname": pool,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(volumeutils, "VOLINFO_DIR", str(tmp_path))
+
+    discovered = volumeutils.get_pv_hosting_volumes(iteration=0)
+
+    assert [volume["name"] for volume in discovered] == [pool]
+    assert discovered[0]["provisioning_disabled"] is True
+
+
+def test_fresh_create_excludes_disabled_pool_from_placement(
+        monkeypatch, tmp_path):
+    volumeutils, controllerserver, csi_pb2 = _load_csi(monkeypatch)
+    pool = "bellagio-pool"
+    (tmp_path / "uid").write_text("ocean-eleven\n", encoding="utf-8")
+    monkeypatch.setattr(controllerserver, "VOLINFO_DIR", str(tmp_path))
+    monkeypatch.setattr(controllerserver, "search_volume", lambda _name: None)
+    monkeypatch.setattr(
+        controllerserver,
+        "get_pv_hosting_volumes",
+        lambda _filters: [{
+            "name": pool,
+            "type": "Replica1",
+            "provisioning_disabled": True,
+            "single_pv_per_pool": False,
+        }],
+    )
+    selected_candidates = []
+
+    def select_pool(volumes, _size):
+        selected_candidates.extend(volumes)
+        return None
+
+    monkeypatch.setattr(
+        controllerserver,
+        "mount_and_select_hosting_volume",
+        select_pool,
+    )
+
+    context = FakeContext()
+    controllerserver.ControllerServer().CreateVolume(
+        csi_pb2.CreateVolumeRequest(
+            name="pvc-danny-ocean",
+            capacity_range={"required_bytes": 20 * 1024 * 1024},
+            volume_capabilities=[_mount_capability()],
+        ),
+        context,
+    )
+
+    assert selected_candidates == []
+    assert context.code == grpc.StatusCode.RESOURCE_EXHAUSTED
+
+
+def test_pending_create_keeps_its_disabled_pool_for_idempotent_retry(
+        monkeypatch, tmp_path):
+    volumeutils, controllerserver, csi_pb2 = _load_csi(monkeypatch)
+    pending = _existing_volume(volumeutils)
+    pending.extra["state"] = "creating"
+    (tmp_path / "uid").write_text("ocean-eleven\n", encoding="utf-8")
+    monkeypatch.setattr(controllerserver, "VOLINFO_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        controllerserver,
+        "search_volume",
+        lambda _name: pending,
+    )
+    monkeypatch.setattr(
+        controllerserver,
+        "get_pv_hosting_volumes",
+        lambda _filters: [{
+            "name": pending.hostvol,
+            "type": "Replica1",
+            "provisioning_disabled": True,
+            "single_pv_per_pool": False,
+        }],
+    )
+    reservation_checks = []
+
+    def stop_after_reservation(*args):
+        reservation_checks.append(args)
+        raise volumeutils.CommandException(
+            -1,
+            "verify_creation_reservation",
+            "the crew paused before opening the vault",
+        )
+
+    monkeypatch.setattr(
+        controllerserver,
+        "verify_creation_reservation",
+        stop_after_reservation,
+    )
+
+    context = FakeContext()
+    controllerserver.ControllerServer().CreateVolume(
+        csi_pb2.CreateVolumeRequest(
+            name=pending.volname,
+            capacity_range={"required_bytes": pending.size},
+            volume_capabilities=[_mount_capability()],
+        ),
+        context,
+    )
+
+    assert reservation_checks == [(
+        pending.hostvol,
+        pending.volname,
+        pending.voltype,
+        pending.size,
+    )]
+    assert context.code == grpc.StatusCode.UNAVAILABLE
 
 
 @pytest.mark.parametrize("pvtype", ["subvol", "rawblock"])

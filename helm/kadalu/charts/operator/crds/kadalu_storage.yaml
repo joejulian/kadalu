@@ -38,6 +38,15 @@ spec:
                 pvReclaimPolicy:
                   type: string
                   default: delete
+                storageClassName:
+                  type: string
+                  minLength: 1
+                  maxLength: 253
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                  description: >-
+                    Immutable StorageClass name for this pool. If omitted,
+                    Kadalu uses kadalu.<metadata.name>. Naming a class default
+                    does not mark it as the cluster default.
                 volume_id:
                   type: string
                 kadalu_format:
