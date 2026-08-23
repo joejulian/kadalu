@@ -36,6 +36,27 @@ For now,
 
 The above 3 fields will be common for config files for all different modes.
 
+=== StorageClass name
+
+Kadalu normally creates `kadalu.<metadata.name>` for a pool. Set
+`.spec.storageClassName` to a valid Kubernetes StorageClass name when the pool
+must use another name:
+
+[source,yaml]
+----
+spec:
+  storageClassName: application-storage
+----
+
+The effective name is immutable after Kadalu creates the pool. Existing pools
+which omit this field continue to use their `kadalu.<metadata.name>` name. The
+same option is supported for native and External pools, and PVCs must select
+the effective name.
+
+Naming a StorageClass `default` does not make it the cluster's default class.
+Kadalu does not add either Kubernetes default-class annotation; default-class
+selection remains an explicit cluster-administrator action.
+
 === Tolerations
 
 * For `.spec.tolerations` refer link:https://github.com/kubernetes-client/python/blob/da6076/kubernetes/docs/V1Toleration.md[Toleration Spec]

@@ -125,7 +125,7 @@ def get_storage_config_data():
 
     for key, value in data.items():
         if key.endswith('info'):
-            key = key.rstrip(".info")
+            key = key.removesuffix(".info")
             value = json.loads(value)
 
             list_of_storages.append(key)

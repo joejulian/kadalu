@@ -3,12 +3,12 @@
 kind: Service
 apiVersion: v1
 metadata:
-  name: {{ volname }}
-  namespace: {{ namespace }}
+  name: {{ volname | tojson }}
+  namespace: {{ namespace | tojson }}
   labels:
     app.kubernetes.io/part-of: kadalu
     app.kubernetes.io/component: server
-    app.kubernetes.io/name: {{ volname }}-service
+    app.kubernetes.io/name: server-service
 spec:
   clusterIP: None
   selector:

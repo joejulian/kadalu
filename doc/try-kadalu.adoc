@@ -97,7 +97,8 @@ With this, there will be 3 bricks, and kadalu CSI driver will mount the correspo
 
 **NOTE**: There can be both replica1 and replica3 type volume co-existing in
 the system. Note that while claiming the PV, you just need to provide relavant
-storageClassName as `storageClassName: kadalu.<name_of_storage_pool>`
+storageClassName as `storageClassName: kadalu.<name_of_storage_pool>`, unless
+the `KadaluStorage` selected a custom `spec.storageClassName`.
 
 === On data recovery
 

@@ -2,16 +2,23 @@
 kind: StorageClass
 apiVersion: storage.k8s.io/v1
 metadata:
-  name: kadalu.{{ volname }}
+  name: {{ storage_class_name | tojson }}
+  annotations:
+    kadalu.io/storage-namespace: {{ namespace | tojson }}
+    kadalu.io/storage-name: {{ volname | tojson }}
+    kadalu.io/storage-uid: {{ storage_uid | default("") | tojson }}
+    kadalu.io/volume-id: {{ volume_id | tojson }}
+    kadalu.io/mount-identity: {{ mount_identity | tojson }}
+    kadalu.io/backend-fingerprint: {{ backend_fingerprint | tojson }}
 provisioner: kadalu
 reclaimPolicy: {{ reclaim_policy }}
 allowVolumeExpansion: {%- if single_pv_per_pool %} false{%- else %} true{%- endif %}
 parameters:
   hostvol_type: "External"
-  gluster_hosts: {{ gluster_hosts }}
-  gluster_volname: {{ gluster_volname }}
+  gluster_hosts: {{ gluster_hosts | tojson }}
+  gluster_volname: {{ gluster_volname | tojson }}
 {%- if gluster_options != "" %}
-  gluster_options: {{ gluster_options }}
+  gluster_options: {{ gluster_options | tojson }}
 {%- endif %}
   # Subdir inside this volume would be a PV if 'single_pv_per_pool' is 'false'
   # else whole volume is used as a single PV if it's 'true'

@@ -3,10 +3,17 @@
 kind: StorageClass
 apiVersion: storage.k8s.io/v1
 metadata:
-  name: kadalu.{{ hostvol_name }}
+  name: {{ storage_class_name | tojson }}
+  annotations:
+    kadalu.io/storage-namespace: {{ namespace | tojson }}
+    kadalu.io/storage-name: {{ hostvol_name | tojson }}
+    kadalu.io/storage-uid: {{ storage_uid | default("") | tojson }}
+    kadalu.io/volume-id: {{ volume_id | tojson }}
+    kadalu.io/mount-identity: {{ mount_identity | tojson }}
+    kadalu.io/backend-fingerprint: {{ backend_fingerprint | tojson }}
 provisioner: kadalu
 reclaimPolicy: {{ reclaim_policy }}
 allowVolumeExpansion: {%- if single_pv_per_pool %} false{%- else %} true{%- endif %}
 parameters:
-  storage_name: {{ hostvol_name }}
+  storage_name: {{ hostvol_name | tojson }}
   single_pv_per_pool: "{{ single_pv_per_pool }}"

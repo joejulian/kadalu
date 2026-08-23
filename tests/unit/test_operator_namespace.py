@@ -110,7 +110,11 @@ def test_operator_watches_only_configured_namespace(monkeypatch):
         "bellagio-crew",
         "kadalustorages",
     )
-    assert stream_calls[0][1] == {"resource_version": "eleven-ocean"}
+    assert stream_calls[0][1] == {
+        "resource_version": "eleven-ocean",
+        "timeout_seconds": main.WATCH_TIMEOUT_SECONDS,
+        "allow_watch_bookmarks": True,
+    }
 
 
 def test_exporter_queries_configured_namespace(monkeypatch):

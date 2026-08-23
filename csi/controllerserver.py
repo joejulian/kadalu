@@ -30,7 +30,8 @@ from volumeutils import (HOSTVOL_MOUNTDIR, check_external_volume,
                          get_accounted_pv_size, get_pv_hosting_volumes,
                          is_hosting_volume_free,
                          mount_and_select_hosting_volume,
-                         mount_single_pv_hosting_volume, search_volume,
+                         mount_single_pv_hosting_volume,
+                         new_volume_hosting_candidates, search_volume,
                          finish_volume_expansion,
                          finish_volume_creation,
                          LegacySinglePVPoolUnclaimedError,
@@ -791,6 +792,8 @@ class ControllerServer(csi_pb2_grpc.ControllerServicer):
             uid = uid_file.read()
 
         host_volumes = get_pv_hosting_volumes(filters)
+        if pending_creation is None:
+            host_volumes = new_volume_hosting_candidates(host_volumes)
         logging.debug(logf(
             "Got list of hosting Volumes",
             volumes=",".join(v['name'] for v in host_volumes)

@@ -3,14 +3,14 @@
 kind: StatefulSet
 apiVersion: apps/v1
 metadata:
-  name: {{ serverpod_name }}
-  namespace: {{ namespace }}
+  name: {{ serverpod_name | tojson }}
+  namespace: {{ namespace | tojson }}
   labels:
     app.kubernetes.io/part-of: kadalu
     app.kubernetes.io/component: server
     app.kubernetes.io/name: server
 spec:
-  serviceName: {{ volname }}
+  serviceName: {{ volname | tojson }}
   selector:
     matchLabels:
       app.kubernetes.io/part-of: kadalu
@@ -26,12 +26,31 @@ spec:
 {%- if tolerations %}
       tolerations:
   {%- for toleration in tolerations %}
-        - key: {{ toleration.get("key") }}
-          operator: {{ toleration.get("operator") }}
-          {%- if toleration.get("value") %}
-          value: {{ toleration.get("value") }}
-          {%- endif %}
-          effect: {{ toleration.get("effect") }}
+    {%- set has_key = "key" in toleration and toleration["key"] is not none %}
+    {%- set has_operator = "operator" in toleration and toleration["operator"] is not none %}
+    {%- set has_value = "value" in toleration and toleration["value"] is not none %}
+    {%- set has_effect = "effect" in toleration and toleration["effect"] is not none %}
+    {%- set has_seconds = "tolerationSeconds" in toleration and toleration["tolerationSeconds"] is not none %}
+    {%- if has_key or has_operator or has_value or has_effect or has_seconds %}
+        -
+      {%- if has_key %}
+          key: {{ toleration["key"] | tojson }}
+      {%- endif %}
+      {%- if has_operator %}
+          operator: {{ toleration["operator"] | tojson }}
+      {%- endif %}
+      {%- if has_value %}
+          value: {{ toleration["value"] | tojson }}
+      {%- endif %}
+      {%- if has_effect %}
+          effect: {{ toleration["effect"] | tojson }}
+      {%- endif %}
+      {%- if has_seconds %}
+          tolerationSeconds: {{ toleration["tolerationSeconds"] | tojson }}
+      {%- endif %}
+    {%- else %}
+        - {}
+    {%- endif %}
   {%- endfor %}
 {%- endif %}
       serviceAccountName: kadalu-server-sa
@@ -44,7 +63,7 @@ spec:
                 - key: kubernetes.io/hostname
                   operator: In
                   values:
-                    - {{ kube_hostname }}
+                    - {{ kube_hostname | tojson }}
 {%- endif %}
 
       containers:
@@ -63,32 +82,32 @@ spec:
           env:
 {%- if kube_hostname != "" %}
             - name: HOSTNAME
-              value: {{ kube_hostname }}
+              value: {{ kube_hostname | tojson }}
 {%- endif %}
 {%- if shd_required %}
             - name: SHD_REQUIRED
               value: "1"
 {%- endif %}
             - name: VOLUME
-              value: {{ volname }}
+              value: {{ volname | tojson }}
             - name: VOLUME_TYPE
-              value: {{ voltype }}
+              value: {{ voltype | tojson }}
             - name: BRICK_PATH
-              value: {{ brick_path }}
+              value: {{ brick_path | tojson }}
             - name: NODEID
-              value: {{ brick_node_id }}
+              value: {{ brick_node_id | tojson }}
             - name: VOLUME_ID
-              value: {{ volume_id }}
+              value: {{ volume_id | tojson }}
             - name: BRICK_INDEX
               value: "{{ brick_index }}"
             - name: BRICK_DEVICE
-              value: "{{ brick_device }}"
+              value: {{ brick_device | tojson }}
             - name: KADALU_VERSION
-              value: "{{ kadalu_version }}"
+              value: {{ kadalu_version | tojson }}
             - name: K8S_DIST
-              value: "{{ k8s_dist }}"
+              value: {{ k8s_dist | tojson }}
             - name: VERBOSE
-              value: "{{ verbose }}"
+              value: {{ verbose | tojson }}
             - name: SUBVOL_ROOT
               value: "subvol"
           securityContext:
@@ -108,7 +127,7 @@ spec:
             - name: glusterfsd-volfilesdir
               mountPath: "/var/lib/gluster"
             - name: glusterfsd-mountdir
-              mountPath: "/bricks/{{ volname }}"
+              mountPath: {{ ("/bricks/" ~ volname) | tojson }}
 {%- if brick_device_dir != "" %}
             - name: brick-device-dir
               mountPath: "/brickdev"
@@ -131,17 +150,17 @@ spec:
         - name: glusterfsd-mountdir
 {%- if pvc_name != "" %}
           persistentVolumeClaim:
-            claimName: {{ pvc_name }}
+            claimName: {{ pvc_name | tojson }}
 {%- elif host_brick_path != "" %}
           hostPath:
-            path: "{{ host_brick_path }}"
+            path: {{ host_brick_path | tojson }}
             type: Directory
-{%- else %}
+{%- elif brick_device != "" %}
           emptyDir: {}
 {%- endif %}
 {%- if brick_device_dir != "" %}
         - name: brick-device-dir
           hostPath:
-            path: "{{ brick_device_dir }}"
+            path: {{ brick_device_dir | tojson }}
             type: Directory
 {%- endif %}

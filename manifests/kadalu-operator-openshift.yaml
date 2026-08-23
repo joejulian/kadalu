@@ -38,6 +38,15 @@ spec:
                 pvReclaimPolicy:
                   type: string
                   default: delete
+                storageClassName:
+                  type: string
+                  minLength: 1
+                  maxLength: 253
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                  description: >-
+                    Immutable StorageClass name for this pool. If omitted,
+                    Kadalu uses kadalu.<metadata.name>. Naming a class default
+                    does not mark it as the cluster default.
                 volume_id:
                   type: string
                 kadalu_format:
@@ -362,6 +371,7 @@ rules:
       - create
       - delete
       - get
+      - list
       - patch
       - update
 ---
@@ -420,6 +430,11 @@ metadata:
     app.kubernetes.io/component: operator
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       name: kadalu
@@ -451,6 +466,15 @@ spec:
             readOnlyRootFilesystem: true
           image: ghcr.io/joejulian/kadalu-operator:devel
           imagePullPolicy: IfNotPresent
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/operator-ready
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 1
           env:
             - name: WATCH_NAMESPACE
               valueFrom:

@@ -7,6 +7,11 @@ metadata:
     app.kubernetes.io/component: operator
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       name: kadalu
@@ -38,6 +43,15 @@ spec:
             readOnlyRootFilesystem: true
           image: {{ include "common.images.image" . }}/kadalu-operator:{{ include "common.version" . }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - test -f /tmp/operator-ready
+            timeoutSeconds: 3
+            periodSeconds: 5
+            failureThreshold: 1
           env:
             - name: WATCH_NAMESPACE
               valueFrom:
