@@ -3021,10 +3021,11 @@ def update_config_map(
         before_config_write=True,
         class_name=data["storageClassName"],
     )
-    configmap_data.data[volinfo_file] = json.dumps(data)
-
-    core_v1_client.patch_namespaced_config_map(
-        KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
+    config_changed = existing_record != data
+    if config_changed:
+        configmap_data.data[volinfo_file] = json.dumps(data)
+        core_v1_client.patch_namespaced_config_map(
+            KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
     reconcile_pool_pv_reclaim_policy(
         core_v1_client,
         volname,
@@ -3032,8 +3033,9 @@ def update_config_map(
         before_config_write=False,
         class_name=data["storageClassName"],
     )
-    logging.info(logf("Updated configmap", name=KADALU_CONFIG_MAP,
-                      volname=volname))
+    if config_changed:
+        logging.info(logf("Updated configmap", name=KADALU_CONFIG_MAP,
+                          volname=volname))
     return True
 
 
@@ -3426,10 +3428,11 @@ def handle_external_storage_addition(
         before_config_write=True,
         class_name=data["storageClassName"],
     )
-    configmap_data.data[volinfo_file] = json.dumps(data)
-
-    core_v1_client.patch_namespaced_config_map(
-        KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
+    config_changed = existing_record != data
+    if config_changed:
+        configmap_data.data[volinfo_file] = json.dumps(data)
+        core_v1_client.patch_namespaced_config_map(
+            KADALU_CONFIG_MAP, NAMESPACE, configmap_data)
     reconcile_pool_pv_reclaim_policy(
         core_v1_client,
         volname,
@@ -3437,8 +3440,9 @@ def handle_external_storage_addition(
         before_config_write=False,
         class_name=data["storageClassName"],
     )
-    logging.info(logf("Updated configmap", name=KADALU_CONFIG_MAP,
-                      volname=volname))
+    if config_changed:
+        logging.info(logf("Updated configmap", name=KADALU_CONFIG_MAP,
+                          volname=volname))
     filename = os.path.join(MANIFESTS_DIR, "external-storageclass.yaml")
     template(
         filename,
@@ -3822,8 +3826,8 @@ def handle_added(
 
     if existing_serialized is not None:
         # Volume already exists
-        logging.warning(logf(
-            "Updating existing config map",
+        logging.debug(logf(
+            "Reconciling existing config map",
             storagename=volname
         ))
         existing = _decode_pool_record(existing_serialized)
