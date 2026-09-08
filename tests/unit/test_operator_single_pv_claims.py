@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import logging
 import sys
 import types
 import uuid
@@ -930,6 +931,91 @@ def test_native_pool_config_persists_server_tolerations(monkeypatch):
     assert _saved_record(client)["tolerations"] == tolerations
 
 
+def test_native_pool_config_skips_semantically_unchanged_patch(
+        monkeypatch, caplog):
+    operator = _load_operator(monkeypatch)
+    client = FakeCoreV1Client({})
+    obj = _native_pool_object()
+
+    assert operator.update_config_map(client, obj) is True
+    record = _saved_record(client)
+    client.config_map.data[f"{POOL_NAME}.info"] = json.dumps(
+        dict(reversed(list(record.items())))
+    )
+    client.patches.clear()
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+
+    assert operator.update_config_map(client, obj) is True
+
+    assert not client.patches
+    assert "Updated configmap" not in caplog.text
+
+
+def test_native_pool_config_patches_real_change_once(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    client = FakeCoreV1Client({})
+    obj = _native_pool_object()
+
+    assert operator.update_config_map(client, obj) is True
+    client.patches.clear()
+    obj["spec"]["options"] = [{
+        "key": "performance.client-io-threads",
+        "value": "on",
+    }]
+
+    assert operator.update_config_map(client, obj) is True
+
+    assert len(client.patches) == 1
+    assert _saved_record(client)["options"] == {
+        "performance.client-io-threads": "on",
+    }
+
+
+def test_external_pool_config_skips_semantically_unchanged_patch(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    client = FakeCoreV1Client({})
+    obj = _external_pool_object()
+    monkeypatch.setattr(operator, "template", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        operator,
+        "reconcile_storage_class_manifest",
+        lambda *_args: None,
+    )
+    empty_storage_api = SimpleNamespace(
+        list_storage_class=lambda: SimpleNamespace(items=[]),
+    )
+
+    assert operator.handle_external_storage_addition(
+        client,
+        obj,
+        empty_storage_api,
+    ) is True
+    record = _saved_record(client)
+    client.config_map.data[f"{POOL_NAME}.info"] = json.dumps(
+        dict(reversed(list(record.items())))
+    )
+    client.patches.clear()
+    storage_api = SimpleNamespace(
+        list_storage_class=lambda: SimpleNamespace(items=[
+            _owned_storage_class(
+                operator,
+                obj,
+                durable=True,
+                mount_identity=record["mount_identity"],
+            ),
+        ]),
+    )
+
+    assert operator.handle_external_storage_addition(
+        client,
+        obj,
+        storage_api,
+    ) is True
+
+    assert not client.patches
+
+
 @pytest.mark.parametrize(
     ("storage_class_name", "expected_name"),
     [
@@ -1767,7 +1853,8 @@ def test_added_reconciliation_reuses_existing_volume_identity(monkeypatch):
     assert received == [HOSTING_VOLUME_ID]
 
 
-def test_added_existing_server_reconciles_offline_config_change(monkeypatch):
+def test_added_existing_server_reconciles_offline_config_change(
+        monkeypatch, caplog):
     operator = _load_operator(monkeypatch)
     existing = {
         "volname": POOL_NAME,
@@ -1821,6 +1908,7 @@ def test_added_existing_server_reconciles_offline_config_change(monkeypatch):
         lambda *command: commands.append(command),
     )
     obj = _native_pool_object(policy="archive")
+    caplog.set_level(logging.WARNING)
 
     operator.handle_added(client, obj, provisioner_fenced=True)
 
@@ -1831,6 +1919,7 @@ def test_added_existing_server_reconciles_offline_config_change(monkeypatch):
     # before its rollout/heal gate. This test replaces that function entirely.
     assert not rendered_services
     assert not commands
+    assert "Updating existing config map" not in caplog.text
 
 
 def test_missing_native_record_recovers_consistent_server_volume_id(
