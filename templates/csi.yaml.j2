@@ -64,7 +64,7 @@ spec:
 {% endif %}
       containers:
         - name: csi-node-driver-registrar
-          image: {{ csi_sidecar_registry }}/sig-storage/csi-node-driver-registrar:v2.17.0@sha256:f9de845b170155199f2a2a3f9531cf13d78e31235e9db6b6582a8b0db0a50dad
+          image: {{ node_driver_registrar_image | tojson }}
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
@@ -108,7 +108,7 @@ spec:
             capabilities:
               add: ["SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: {{ images_hub }}/{{ docker_user }}/kadalu-csi:{{ kadalu_version }}
+          image: {{ csi_image | tojson }}
           env:
             - name: NODE_ID
               valueFrom:
@@ -142,7 +142,7 @@ spec:
               mountPath: {{ kubelet_dir }}/plugins/kubernetes.io/csi
               mountPropagation: "Bidirectional"
         - name: csi-liveness-probe
-          image: {{ csi_sidecar_registry }}/sig-storage/livenessprobe:v2.19.0@sha256:06da0d5b8908072f2e4522692aee8dc119fba7247a9658497e1153992cd777e9
+          image: {{ liveness_probe_image | tojson }}
           args:
             - "--csi-address=/plugin/csi.sock"
             - "--http-endpoint=:9808"
@@ -160,7 +160,7 @@ spec:
             - name: plugin-dir
               mountPath: /plugin
         - name: kadalu-logging
-          image: {{ busybox_image }}
+          image: {{ busybox_image | tojson }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
           args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -f /var/log/gluster/*.log"]
@@ -227,7 +227,7 @@ spec:
       serviceAccountName: kadalu-csi-provisioner
       containers:
         - name: csi-provisioner
-          image: {{ csi_sidecar_registry }}/sig-storage/csi-provisioner:v6.3.0@sha256:a4b0b1a37605b7b04a293e136edf7006ec1786a8eb3f4e5a945f81d667dcc371
+          image: {{ provisioner_image | tojson }}
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
@@ -263,7 +263,7 @@ spec:
             capabilities:
               add: ["CAP_SYS_ADMIN", "SYS_ADMIN"]
             allowPrivilegeEscalation: true
-          image: {{ images_hub }}/{{ docker_user }}/kadalu-csi:{{ kadalu_version }}
+          image: {{ csi_image | tojson }}
           ports:
             - name: driver-health
               containerPort: 9809
@@ -324,7 +324,7 @@ spec:
               readOnly: true
               mountPath: "/etc/secret-volume"
         - name: kadalu-logging
-          image: {{ busybox_image }}
+          image: {{ busybox_image | tojson }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
           args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -F /var/log/gluster/*.log"]
@@ -332,7 +332,7 @@ spec:
             - name: varlog
               mountPath: "/var/log/gluster"
         - name: csi-resizer
-          image: {{ csi_sidecar_registry }}/sig-storage/csi-resizer:v2.2.1@sha256:ea1d25e23479000c7e8eeb92d827df66258df4e482ca054c5e7ce3fc0f5c41a5
+          image: {{ resizer_image | tojson }}
           args:
             - "--csi-address=$(ADDRESS)"
             - "--timeout=3m"
@@ -363,7 +363,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-liveness-probe
-          image: {{ csi_sidecar_registry }}/sig-storage/livenessprobe:v2.19.0@sha256:06da0d5b8908072f2e4522692aee8dc119fba7247a9658497e1153992cd777e9
+          image: {{ liveness_probe_image | tojson }}
           args:
             - "--csi-address=/plugin/csi.sock"
             - "--http-endpoint=:9809"

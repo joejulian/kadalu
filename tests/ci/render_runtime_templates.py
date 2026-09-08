@@ -42,8 +42,10 @@ def runtime_manifests():
             serverpod_name="server-bellagio-vault-0",
             volname="bellagio-vault",
             voltype="Replica1",
-            images_hub="registry.example.invalid",
-            docker_user="heist-crew",
+            server_image=(
+                "registry.example.invalid/heist-crew/"
+                "kadalu-server:test@sha256:server"
+            ),
             kadalu_version="test",
             k8s_dist="kubernetes",
             verbose="no",
@@ -101,13 +103,30 @@ def runtime_manifests():
         render(
             "csi.yaml.j2",
             namespace=NAMESPACE,
-            images_hub="registry.example.invalid",
-            docker_user="heist-crew",
             kadalu_version="test",
+            csi_image=(
+                "registry.example.invalid/heist-crew/"
+                "kadalu-csi:test@sha256:csi"
+            ),
             k8s_dist="kubernetes",
             kubelet_dir="/var/lib/kubelet",
             verbose="no",
-            csi_sidecar_registry="registry.k8s.io",
+            node_driver_registrar_image=(
+                "registry.k8s.io/sig-storage/csi-node-driver-registrar:"
+                "v2.17.0@sha256:registrar"
+            ),
+            provisioner_image=(
+                "registry.k8s.io/sig-storage/csi-provisioner:"
+                "v6.3.0@sha256:provisioner"
+            ),
+            resizer_image=(
+                "registry.k8s.io/sig-storage/csi-resizer:"
+                "v2.2.1@sha256:resizer"
+            ),
+            liveness_probe_image=(
+                "registry.k8s.io/sig-storage/livenessprobe:"
+                "v2.19.0@sha256:liveness"
+            ),
             busybox_image=(
                 "docker.io/library/busybox:1.37.0@sha256:"
                 "9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0"

@@ -44,13 +44,17 @@ def _render_csi_documents(
     )
     values = {
         "namespace": "the-vault",
-        "images_hub": "registry.example.invalid",
-        "docker_user": "ocean-crew",
         "kadalu_version": "test",
+        "csi_image": "registry.example.invalid/ocean-crew/kadalu-csi:test",
         "k8s_dist": "kubernetes",
         "kubelet_dir": "/var/lib/kubelet",
         "verbose": "no",
-        "csi_sidecar_registry": "registry.k8s.io",
+        "node_driver_registrar_image": SIDECAR_IMAGES[
+            "csi-node-driver-registrar"
+        ],
+        "provisioner_image": SIDECAR_IMAGES["csi-provisioner"],
+        "resizer_image": SIDECAR_IMAGES["csi-resizer"],
+        "liveness_probe_image": SIDECAR_IMAGES["csi-liveness-probe"],
         "busybox_image": BUSYBOX_IMAGE,
         "nodeplugin_tolerations": (
             []
@@ -73,8 +77,7 @@ def _render_server(tolerations):
         serverpod_name="server-bellagio-vault-0",
         volname="bellagio-vault",
         voltype="Replica1",
-        images_hub="registry.example.invalid",
-        docker_user="ocean-crew",
+        server_image="registry.example.invalid/ocean-crew/kadalu-server:test",
         kadalu_version="test",
         k8s_dist="kubernetes",
         verbose="no",
