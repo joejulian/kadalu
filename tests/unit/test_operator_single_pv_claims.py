@@ -4291,7 +4291,9 @@ def test_deploy_csi_passes_configured_busybox_image(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(operator, "MANIFESTS_DIR", str(tmp_path))
-    monkeypatch.setattr(operator, "BUSYBOX_IMAGE", busybox_image)
+    component_config = dict(operator.COMPONENT_CONFIG)
+    component_config["logging_image"] = busybox_image
+    monkeypatch.setattr(operator, "COMPONENT_CONFIG", component_config)
     monkeypatch.setattr(
         operator,
         "template",
@@ -4307,6 +4309,119 @@ def test_deploy_csi_passes_configured_busybox_image(monkeypatch, tmp_path):
         if filename.endswith("/csi.yaml")
     )
     assert csi_values["busybox_image"] == busybox_image
+
+
+def test_component_config_maps_override_independent_image_sets(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    config_maps = {
+        operator.CSI_CONFIG_MAP: SimpleNamespace(data={
+            "version": "1.5.0",
+            "driverImage": "registry.example.invalid/kadalu-csi@sha256:c51",
+            "loggingImage": "registry.example.invalid/busybox@sha256:b05",
+        }),
+        operator.SERVER_CONFIG_MAP: SimpleNamespace(data={
+            "version": "1.4.7",
+            "image": "registry.example.invalid/kadalu-server@sha256:5e7",
+        }),
+    }
+    core_client = SimpleNamespace(
+        read_namespaced_config_map=(
+            lambda name, _namespace: config_maps[name]
+        ),
+    )
+
+    resolved, fingerprint = operator.read_component_configuration(core_client)
+
+    assert resolved["csi_version"] == "1.5.0"
+    assert resolved["csi_image"].endswith("@sha256:c51")
+    assert resolved["logging_image"].endswith("@sha256:b05")
+    assert resolved["server_version"] == "1.4.7"
+    assert resolved["server_image"].endswith("@sha256:5e7")
+    assert fingerprint == json.dumps(
+        resolved,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_component_config_map_rejects_unknown_keys(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    core_client = SimpleNamespace(
+        read_namespaced_config_map=lambda name, _namespace: SimpleNamespace(
+            data={"typoImage": "registry.example.invalid/wrong@sha256:bad"}
+            if name == operator.CSI_CONFIG_MAP else {},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported keys: typoImage"):
+        operator.read_component_configuration(core_client)
+
+
+def test_changed_component_config_uses_full_fenced_reconciliation(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    calls = []
+    core_client = object()
+    apps_client = object()
+    storage_client = object()
+    storage_plan = _storage_plan(resource_version="component-9")
+    desired = dict(operator.DEFAULT_COMPONENT_CONFIG)
+    desired["csi_version"] = "1.5.0"
+    monkeypatch.setattr(
+        operator,
+        "read_component_configuration",
+        lambda _core: (desired, "new-fingerprint"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "clear_operator_ready",
+        lambda: calls.append("unready"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "deploy_csi_upgrade",
+        lambda *_args: calls.append("csi-upgrade") or storage_plan,
+    )
+    monkeypatch.setattr(
+        operator,
+        "reconcile_storage_until_stable",
+        lambda *_args: calls.append("servers") or storage_plan,
+    )
+    monkeypatch.setattr(
+        operator,
+        "deploy_csi_pods",
+        lambda *_args, **_kwargs: calls.append("csi-serving"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "wait_for_csi_provisioner_rollout",
+        lambda *_args: calls.append("provisioner-ready"),
+    )
+    monkeypatch.setattr(
+        operator,
+        "mark_operator_ready",
+        lambda: calls.append("ready"),
+    )
+
+    fingerprint, resource_version = operator.reconcile_component_configuration(
+        core_client,
+        apps_client,
+        storage_client,
+        "old-fingerprint",
+        "old-resource-version",
+    )
+
+    assert calls == [
+        "unready",
+        "csi-upgrade",
+        "servers",
+        "csi-serving",
+        "provisioner-ready",
+        "ready",
+    ]
+    assert operator.COMPONENT_CONFIG == desired
+    assert fingerprint == "new-fingerprint"
+    assert resource_version == "component-9"
 
 
 def test_csi_upgrade_keeps_provisioner_fenced_after_nodeplugin_rollout(
@@ -6250,6 +6365,12 @@ def test_upgrade_quiesces_before_migration_and_csi_rollout(monkeypatch):
     )
     monkeypatch.setattr(
         operator,
+        "load_component_configuration",
+        lambda received: "component-config-1"
+        if received is core_client else None,
+    )
+    monkeypatch.setattr(
+        operator,
         "deploy_config_map",
         lambda received: (
             calls.append("config-map") or ("ocean-crew", True)
@@ -6301,7 +6422,8 @@ def test_upgrade_quiesces_before_migration_and_csi_rollout(monkeypatch):
     monkeypatch.setattr(
         operator,
         "crd_watch",
-        lambda core, k8s, apps, resource_version=None: calls.append(
+        lambda core, k8s, apps, resource_version=None,
+        component_config_fingerprint=None: calls.append(
             "crd-watch"
         )
         if (
@@ -6309,6 +6431,7 @@ def test_upgrade_quiesces_before_migration_and_csi_rollout(monkeypatch):
             and k8s is api_client
             and apps is apps_client
             and resource_version == "117"
+            and component_config_fingerprint == "component-config-1"
         ) else None,
     )
 
@@ -6367,6 +6490,12 @@ def test_fresh_start_reconciles_precreated_crs_before_serving(monkeypatch):
     )
     monkeypatch.setattr(
         operator,
+        "load_component_configuration",
+        lambda received: "component-config-2"
+        if received is core_client else None,
+    )
+    monkeypatch.setattr(
+        operator,
         "deploy_config_map",
         lambda _core: ("ocean-crew", False),
     )
@@ -6413,12 +6542,14 @@ def test_fresh_start_reconciles_precreated_crs_before_serving(monkeypatch):
     monkeypatch.setattr(
         operator,
         "crd_watch",
-        lambda core, k8s, apps, resource_version=None: calls.append("watch")
+        lambda core, k8s, apps, resource_version=None,
+        component_config_fingerprint=None: calls.append("watch")
         if (
             core is core_client
             and k8s is api_client
             and apps is apps_client
             and resource_version == "fresh-8"
+            and component_config_fingerprint == "component-config-2"
         ) else None,
     )
     monkeypatch.setattr(
@@ -6520,6 +6651,11 @@ def test_server_upgrade_failure_keeps_provisioner_fenced(monkeypatch):
     )
     monkeypatch.setattr(
         operator,
+        "load_component_configuration",
+        lambda _core: "component-config-3",
+    )
+    monkeypatch.setattr(
+        operator,
         "deploy_config_map",
         lambda _core: ("ocean-crew", True),
     )
@@ -6594,6 +6730,11 @@ def test_initial_reconciliation_failure_keeps_provisioner_fenced(
         "CustomObjectsApi",
         lambda _client: storage_client,
         raising=False,
+    )
+    monkeypatch.setattr(
+        operator,
+        "load_component_configuration",
+        lambda _core: "component-config-4",
     )
     monkeypatch.setattr(
         operator,
@@ -6696,6 +6837,11 @@ def test_storage_api_failure_before_mutation_does_not_change_provisioner(
         "CustomObjectsApi",
         lambda received: storage_client if received is api_client else None,
         raising=False,
+    )
+    monkeypatch.setattr(
+        operator,
+        "load_component_configuration",
+        lambda _core: "component-config-5",
     )
     monkeypatch.setattr(
         operator,

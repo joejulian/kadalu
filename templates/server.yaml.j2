@@ -68,7 +68,7 @@ spec:
 
       containers:
         - name: server
-          image: {{ images_hub }}/{{ docker_user }}/kadalu-server:{{ kadalu_version }}
+          image: {{ server_image | tojson }}
           readinessProbe:
             tcpSocket:
               port: 24007

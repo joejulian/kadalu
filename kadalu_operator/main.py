@@ -30,6 +30,7 @@ NAMESPACE = os.environ.get("KADALU_NAMESPACE", "kadalu")
 VERSION = os.environ.get("KADALU_VERSION", "latest")
 K8S_DIST = os.environ.get("K8S_DIST", "kubernetes")
 IMAGES_HUB = os.environ.get("IMAGES_HUB", "ghcr.io")
+DOCKER_USER = os.environ.get("DOCKER_USER", "joejulian")
 CSI_SIDECAR_REGISTRY = os.environ.get(
     "CSI_SIDECAR_REGISTRY", "registry.k8s.io"
 )
@@ -40,6 +41,63 @@ BUSYBOX_IMAGE = os.environ.get(
 )
 KUBELET_DIR = os.environ.get("KUBELET_DIR")
 VERBOSE = os.environ.get("VERBOSE", "no")
+CSI_CONFIG_MAP = os.environ.get(
+    "KADALU_CSI_CONFIG_MAP", "kadalu-csi-config"
+)
+SERVER_CONFIG_MAP = os.environ.get(
+    "KADALU_SERVER_CONFIG_MAP", "kadalu-server-config"
+)
+DEFAULT_COMPONENT_CONFIG = {
+    "csi_version": VERSION,
+    "csi_image": f"{IMAGES_HUB}/{DOCKER_USER}/kadalu-csi:{VERSION}",
+    "node_driver_registrar_image": (
+        f"{CSI_SIDECAR_REGISTRY}/sig-storage/csi-node-driver-registrar:"
+        "v2.17.0@sha256:"
+        "f9de845b170155199f2a2a3f9531cf13d78e31235e9db6b6582a8b0db0a50dad"
+    ),
+    "provisioner_image": (
+        f"{CSI_SIDECAR_REGISTRY}/sig-storage/csi-provisioner:"
+        "v6.3.0@sha256:"
+        "a4b0b1a37605b7b04a293e136edf7006ec1786a8eb3f4e5a945f81d667dcc371"
+    ),
+    "resizer_image": (
+        f"{CSI_SIDECAR_REGISTRY}/sig-storage/csi-resizer:"
+        "v2.2.1@sha256:"
+        "ea1d25e23479000c7e8eeb92d827df66258df4e482ca054c5e7ce3fc0f5c41a5"
+    ),
+    "liveness_probe_image": (
+        f"{CSI_SIDECAR_REGISTRY}/sig-storage/livenessprobe:"
+        "v2.19.0@sha256:"
+        "06da0d5b8908072f2e4522692aee8dc119fba7247a9658497e1153992cd777e9"
+    ),
+    "logging_image": BUSYBOX_IMAGE,
+    "kubelet_dir": KUBELET_DIR,
+    "csi_k8s_dist": K8S_DIST,
+    "csi_verbose": VERBOSE,
+    "server_version": VERSION,
+    "server_image": f"{IMAGES_HUB}/{DOCKER_USER}/kadalu-server:{VERSION}",
+    "server_k8s_dist": K8S_DIST,
+    "server_verbose": VERBOSE,
+}
+COMPONENT_CONFIG = dict(DEFAULT_COMPONENT_CONFIG)
+CSI_CONFIG_FIELDS = {
+    "version": "csi_version",
+    "driverImage": "csi_image",
+    "nodeDriverRegistrarImage": "node_driver_registrar_image",
+    "provisionerImage": "provisioner_image",
+    "resizerImage": "resizer_image",
+    "livenessProbeImage": "liveness_probe_image",
+    "loggingImage": "logging_image",
+    "kubeletDir": "kubelet_dir",
+    "kubernetesDistro": "csi_k8s_dist",
+    "verbose": "csi_verbose",
+}
+SERVER_CONFIG_FIELDS = {
+    "version": "server_version",
+    "image": "server_image",
+    "kubernetesDistro": "server_k8s_dist",
+    "verbose": "server_verbose",
+}
 TEMPLATES_DIR = os.environ.get("KADALU_TEMPLATES_DIR", "/kadalu/templates")
 MANIFESTS_DIR = os.environ.get("KADALU_MANIFESTS_DIR", "/tmp/kadalu-manifests")
 OPERATOR_READY_FILE = "/tmp/operator-ready"
@@ -151,6 +209,98 @@ def clear_operator_ready():
         os.unlink(OPERATOR_READY_FILE)
     except FileNotFoundError:
         pass
+
+
+def _read_optional_component_config(core_v1_client, name, fields):
+    """Read and validate one optional Helm-owned component ConfigMap."""
+    try:
+        config_map = core_v1_client.read_namespaced_config_map(
+            name,
+            NAMESPACE,
+        )
+    except Exception as err:  # pylint: disable=broad-exception-caught
+        if getattr(err, "status", None) not in (404, "404"):
+            raise
+        return {}
+
+    data = config_map.data or {}
+    unknown = sorted(set(data) - set(fields))
+    if unknown:
+        raise ValueError(
+            f"ConfigMap {name} has unsupported keys: {', '.join(unknown)}"
+        )
+
+    values = {}
+    for key, value in data.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"ConfigMap {name} data key {key} must be a non-empty string"
+            )
+        values[fields[key]] = value
+    return values
+
+
+def read_component_configuration(core_v1_client):
+    """Resolve independently released CSI and server configuration."""
+    resolved = dict(DEFAULT_COMPONENT_CONFIG)
+    resolved.update(_read_optional_component_config(
+        core_v1_client,
+        CSI_CONFIG_MAP,
+        CSI_CONFIG_FIELDS,
+    ))
+    resolved.update(_read_optional_component_config(
+        core_v1_client,
+        SERVER_CONFIG_MAP,
+        SERVER_CONFIG_FIELDS,
+    ))
+    fingerprint = json.dumps(
+        resolved,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return resolved, fingerprint
+
+
+def load_component_configuration(core_v1_client):
+    """Activate the latest validated component configuration."""
+    global COMPONENT_CONFIG  # pylint: disable=global-statement
+    resolved, fingerprint = read_component_configuration(core_v1_client)
+    COMPONENT_CONFIG = resolved
+    return fingerprint
+
+
+def reconcile_component_configuration(
+        core_v1_client, apps_v1_client, storage_client,
+        current_fingerprint, resource_version):
+    """Apply changed component releases through the normal safety fences."""
+    global COMPONENT_CONFIG  # pylint: disable=global-statement
+    resolved, fingerprint = read_component_configuration(core_v1_client)
+    if fingerprint == current_fingerprint:
+        return current_fingerprint, resource_version
+
+    logging.info("Component configuration changed; reconciling safely")
+    clear_operator_ready()
+    COMPONENT_CONFIG = resolved
+    storage_plan = deploy_csi_upgrade(
+        core_v1_client,
+        apps_v1_client,
+        storage_client,
+    )
+    storage_plan = reconcile_storage_until_stable(
+        core_v1_client,
+        apps_v1_client,
+        storage_client,
+        storage_plan,
+    )
+    deploy_csi_pods(
+        core_v1_client,
+        provisioner_replicas=1,
+        nodeplugin_tolerations=storage_plan["nodeplugin_tolerations"],
+    )
+    wait_for_csi_provisioner_rollout(apps_v1_client)
+    mark_operator_ready()
+    return fingerprint, storage_plan["resource_version"]
 
 
 def template(filename, **kwargs):
@@ -3192,7 +3342,6 @@ def deploy_server_pods(obj, apps_v1_client=None):
     voltype = obj["spec"]["type"]
     pv_reclaim_policy = obj["spec"].get("pvReclaimPolicy", "delete")
     tolerations = obj["spec"].get("tolerations")
-    docker_user = os.environ.get("DOCKER_USER", "joejulian")
     if voltype in HEAL_GATED_VOLUME_TYPES and apps_v1_client is None:
         raise RuntimeError(
             f"Storage pool {volname} requires the Kubernetes Apps client "
@@ -3204,9 +3353,8 @@ def deploy_server_pods(obj, apps_v1_client=None):
 
     template_args = {
         "namespace": NAMESPACE,
-        "kadalu_version": VERSION,
-        "images_hub": IMAGES_HUB,
-        "docker_user": docker_user,
+        "kadalu_version": COMPONENT_CONFIG["server_version"],
+        "server_image": COMPONENT_CONFIG["server_image"],
         "volname": volname,
         "voltype": voltype,
         "pvReclaimPolicy": pv_reclaim_policy,
@@ -3231,8 +3379,8 @@ def deploy_server_pods(obj, apps_v1_client=None):
         template_args["pvc_name"] = storage.get("pvc", "")
         template_args["brick_device_dir"] = get_brick_device_dir(storage)
         template_args["brick_node_id"] = storage["node_id"]
-        template_args["k8s_dist"] = K8S_DIST
-        template_args["verbose"] = VERBOSE
+        template_args["k8s_dist"] = COMPONENT_CONFIG["server_k8s_dist"]
+        template_args["verbose"] = COMPONENT_CONFIG["server_verbose"]
         template_args["tolerations"] = tolerations
 
         server_templates.append((storage, dict(template_args)))
@@ -4873,21 +5021,18 @@ def delete_server_pods(storage_info_data, obj):
     voltype = storage_info_data['type']
     volumeid = storage_info_data['volume_id']
 
-    docker_user = os.environ.get("DOCKER_USER", "joejulian")
-
     shd_required = voltype in HEAL_GATED_VOLUME_TYPES
 
     template_args = {
         "namespace": NAMESPACE,
-        "kadalu_version": VERSION,
-        "docker_user": docker_user,
-        "images_hub": IMAGES_HUB,
+        "kadalu_version": COMPONENT_CONFIG["server_version"],
+        "server_image": COMPONENT_CONFIG["server_image"],
         "volname": volname,
         "voltype": voltype,
         "volume_id": volumeid,
         "shd_required": shd_required,
         "tolerations": storage_info_data.get("tolerations", []),
-        "verbose": VERBOSE,
+        "verbose": COMPONENT_CONFIG["server_verbose"],
     }
 
     bricks = storage_info_data['bricks']
@@ -4912,7 +5057,7 @@ def delete_server_pods(storage_info_data, obj):
             "",
         )
         template_args["brick_node_id"] = brick['node_id']
-        template_args["k8s_dist"] = K8S_DIST
+        template_args["k8s_dist"] = COMPONENT_CONFIG["server_k8s_dist"]
 
         filename = os.path.join(MANIFESTS_DIR, "server.yaml")
         template(filename, **template_args)
@@ -5309,7 +5454,7 @@ def watch_stream(
 
 def crd_watch(
         core_v1_client, k8s_client, apps_v1_client=None,
-        resource_version=None):
+        resource_version=None, component_config_fingerprint=None):
     """
     Watches the CRD to provision new PV Hosting Volumes
     """
@@ -5321,6 +5466,18 @@ def crd_watch(
                 apps_v1_client,
                 resource_version=resource_version,
             )
+            if component_config_fingerprint is not None:
+                storage_client = client.CustomObjectsApi(k8s_client)
+                (
+                    component_config_fingerprint,
+                    resource_version,
+                ) = reconcile_component_configuration(
+                    core_v1_client,
+                    apps_v1_client,
+                    storage_client,
+                    component_config_fingerprint,
+                    resource_version,
+                )
         except (ProtocolError, NewConnectionError):
             # It might so happen that this'll be logged for every hit in k8s
             # event stream in kadalu namespace and better to log at debug level
@@ -5608,17 +5765,29 @@ def deploy_csi_pods(
     # storage.k8s.io/v1 has been served since Kubernetes 1.18 and is the only
     # CSIDriver API available on the supported Kubernetes 1.36 baseline.
     filename = os.path.join(MANIFESTS_DIR, "csi-driver-object-v1.yaml")
-    template(filename, namespace=NAMESPACE, kadalu_version=VERSION)
+    template(
+        filename,
+        namespace=NAMESPACE,
+        kadalu_version=COMPONENT_CONFIG["csi_version"],
+    )
     lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
 
     filename = os.path.join(MANIFESTS_DIR, "csi.yaml")
-    docker_user = os.environ.get("DOCKER_USER", "joejulian")
-    template(filename, namespace=NAMESPACE, kadalu_version=VERSION,
-             docker_user=docker_user, k8s_dist=K8S_DIST,
-             images_hub=IMAGES_HUB,
-             csi_sidecar_registry=CSI_SIDECAR_REGISTRY,
-             busybox_image=BUSYBOX_IMAGE,
-             kubelet_dir=KUBELET_DIR, verbose=VERBOSE,
+    template(filename, namespace=NAMESPACE,
+             kadalu_version=COMPONENT_CONFIG["csi_version"],
+             csi_image=COMPONENT_CONFIG["csi_image"],
+             node_driver_registrar_image=(
+                 COMPONENT_CONFIG["node_driver_registrar_image"]
+             ),
+             provisioner_image=COMPONENT_CONFIG["provisioner_image"],
+             resizer_image=COMPONENT_CONFIG["resizer_image"],
+             liveness_probe_image=(
+                 COMPONENT_CONFIG["liveness_probe_image"]
+             ),
+             busybox_image=COMPONENT_CONFIG["logging_image"],
+             kubelet_dir=COMPONENT_CONFIG["kubelet_dir"],
+             k8s_dist=COMPONENT_CONFIG["csi_k8s_dist"],
+             verbose=COMPONENT_CONFIG["csi_verbose"],
              provisioner_replicas=provisioner_replicas,
              nodeplugin_tolerations=nodeplugin_tolerations)
 
@@ -6333,6 +6502,10 @@ def _run_operator():
     apps_v1_client = client.AppsV1Api(k8s_client)
     storage_client = client.CustomObjectsApi(k8s_client)
 
+    component_config_fingerprint = load_component_configuration(
+        core_v1_client,
+    )
+
     # ConfigMap
     uid, upgrade = deploy_config_map(core_v1_client)
 
@@ -6371,6 +6544,7 @@ def _run_operator():
         k8s_client,
         apps_v1_client,
         resource_version=storage_plan["resource_version"],
+        component_config_fingerprint=component_config_fingerprint,
     )
 
 
