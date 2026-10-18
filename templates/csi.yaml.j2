@@ -163,7 +163,7 @@ spec:
           image: {{ busybox_image | tojson }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
-          args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -f /var/log/gluster/*.log"]
+          args: ["-c", "while true; do set -- /var/log/gluster/*.log; if [ -f \"$1\" ]; then exec tail -F \"$@\"; fi; sleep 5; done"]
           volumeMounts:
             - name: varlog
               mountPath: "/var/log/gluster"
@@ -327,7 +327,7 @@ spec:
           image: {{ busybox_image | tojson }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
-          args: ["-c", "while true; do logcnt=$(/bin/ls /var/log/gluster/ | wc -l); if [ ${logcnt} -gt 0 ]; then break; fi; sleep 5; done; tail -F /var/log/gluster/*.log"]
+          args: ["-c", "while true; do set -- /var/log/gluster/*.log; if [ -f \"$1\" ]; then exec tail -F \"$@\"; fi; sleep 5; done"]
           volumeMounts:
             - name: varlog
               mountPath: "/var/log/gluster"
