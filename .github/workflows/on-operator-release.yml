@@ -161,5 +161,5 @@ jobs:
           tests/ci/verify-image-provenance.sh "${REFERENCE}" "${EXPECTED_REVISION}" "${EXPECTED_SOURCE}"
           anonymous_config="$(mktemp -d)"
           test -n "${anonymous_config}"
-          trap 'rm -r -- "${anonymous_config}"' EXIT
+          trap 'rmdir -- "${anonymous_config}" 2>/dev/null || true' EXIT
           DOCKER_CONFIG="${anonymous_config}" docker manifest inspect "${REFERENCE}" >/dev/null
