@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import urllib3
 from jinja2 import Template
 
+import kadaluheal as heal
 from kadalulib import CommandException
 from kadalulib import execute as lib_execute
 from kadalulib import (is_host_reachable, logf, logging_setup,
@@ -3190,82 +3191,31 @@ def update_config_map(
 
 
 def storage_heal_summary_is_clean(summary, expected_bricks):
-    """Return whether every brick is connected with no pending heal work."""
-    if not isinstance(summary, str) or expected_bricks < 1:
-        return False
-
-    statuses = re.findall(r"^Status:\s*(.+?)\s*$", summary, re.MULTILINE)
-    if (
-            len(statuses) != expected_bricks
-            or any(status != "Connected" for status in statuses)):
-        return False
-
-    counters = (
-        "Total Number of entries",
-        "Number of entries in heal pending",
-        "Number of entries in split-brain",
-        "Number of entries possibly healing",
-    )
-    for label in counters:
-        values = re.findall(
-            rf"^{re.escape(label)}:\s*([0-9]+)\s*$",
-            summary,
-            re.MULTILINE,
-        )
-        if (
-                len(values) != expected_bricks
-                or any(int(value) != 0 for value in values)):
-            return False
-    return True
+    """Require every brick connected and every heal counter equal to zero."""
+    return heal.storage_heal_summary_is_clean(summary, expected_bricks)
 
 
 def wait_for_storage_heal(
         volname, server_names, timeout_seconds=HEAL_WAIT_TIMEOUT_SECONDS,
         poll_interval=HEAL_WAIT_INTERVAL_SECONDS):
-    """Wait until one server reports every pool brick connected and clean."""
-    deadline = time.monotonic() + timeout_seconds
-    last_error = "no server accepted the heal query"
-    while True:
-        for server_name in server_names:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                stdout, _stderr, _pid = lib_execute(
-                    KUBECTL_CMD,
-                    "-n",
-                    NAMESPACE,
-                    "exec",
-                    server_name,
-                    "-c",
-                    "server",
-                    "--",
-                    "/opt/libexec/glusterfs/glfsheal",
-                    volname,
-                    "info-summary",
-                    "volfile-path",
-                    f"/var/lib/kadalu/volfiles/{volname}.vol",
-                    timeout=max(1, remaining),
-                )
-            except CommandException as err:
-                last_error = str(err)
-                continue
-            if storage_heal_summary_is_clean(stdout, len(server_names)):
-                logging.info(logf(
-                    "Storage heal gate is clean",
-                    volname=volname,
-                    server=server_name,
-                ))
-                return
-            last_error = f"unclean or incomplete summary from {server_name}"
-
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"Timed out waiting for storage pool {volname} to report "
-                f"every brick Connected with zero heal entries: {last_error}. "
-                "Further brick StatefulSet rollouts were not attempted."
+    """Wait for a clean pool-wide summary without querying every brick."""
+    def query(server_name, remaining):
+        try:
+            stdout, _stderr, _pid = lib_execute(
+                KUBECTL_CMD, "-n", NAMESPACE, "exec", server_name,
+                "-c", "server", "--", "/opt/libexec/glusterfs/glfsheal",
+                volname, "info-summary", "volfile-path",
+                f"/var/lib/kadalu/volfiles/{volname}.vol",
+                timeout=remaining,
             )
-        time.sleep(poll_interval)
+        except CommandException as error:
+            raise heal.HealQueryError(str(error)) from error
+        return stdout
+
+    heal.wait_for_storage_heal(
+        volname, server_names, timeout_seconds=timeout_seconds,
+        poll_interval=poll_interval, query=query,
+    )
 
 
 def existing_server_statefulset_names(apps_v1_client, server_names):

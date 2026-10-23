@@ -79,6 +79,7 @@ def test_rendered_manifests_are_separate_from_templates(tmp_path, monkeypatch):
 
     # Imports are intentionally local so the manifest-only test above does not
     # require the operator's runtime dependencies.
+    monkeypatch.syspath_prepend(str(ROOT / "lib"))
     monkeypatch.syspath_prepend(str(ROOT / "cli" / "kubectl_kadalu"))
     fake_kadalulib = types.ModuleType("kadalulib")
     fake_kadalulib.CommandException = RuntimeError
