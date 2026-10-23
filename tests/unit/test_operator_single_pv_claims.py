@@ -45,6 +45,7 @@ def _single_pv_per_pool(data):
 
 def _load_operator(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
+    monkeypatch.syspath_prepend(str(ROOT / "lib"))
     monkeypatch.syspath_prepend(str(ROOT / "cli" / "kubectl_kadalu"))
     fake_kadalulib = types.ModuleType("kadalulib")
     fake_kadalulib.CommandException = RuntimeError
