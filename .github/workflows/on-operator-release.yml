@@ -1,0 +1,165 @@
+name: Operator Release
+
+on:
+  push:
+    tags:
+      - "operator-*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: operator-release-publishing
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: ./.github/workflows/on-pr-submit.yml
+
+  publish:
+    name: Publish the operator artifact
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate the artifact version and pinned builder
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          core = r"(?:0|[1-9][0-9]*)"
+          identifier = r"(?:0|[1-9][0-9]*|(?=[0-9A-Za-z-]*[A-Za-z-])[0-9A-Za-z-]+)"
+          pattern = rf"operator-({core}\.{core}\.{core}(?:-{identifier}(?:\.{identifier})*)?)"
+          match = re.fullmatch(pattern, os.environ["RELEASE_TAG"])
+          if match is None:
+              raise SystemExit("Expected an operator-scoped canonical SemVer tag")
+          pin = json.loads(Path("extras/operator-release-builder.json").read_text())
+          revision = pin["revision"]
+          namespace = os.environ["REPOSITORY"].split("/")[0].lower()
+          prefix = f"ghcr.io/{namespace}/kadalu-builder:{revision}@sha256:"
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise SystemExit("The builder revision must be a complete commit SHA")
+          if not pin["image"].startswith(prefix) or not re.fullmatch(
+              r"[0-9a-f]{64}", pin["image"][len(prefix):]
+          ):
+              raise SystemExit("The builder must be owned by this repository and digest pinned")
+          builddate = subprocess.check_output(
+              ["git", "show", "--no-patch", "--format=%cI", "HEAD"], text=True
+          ).strip()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={match[1]}\n")
+              output.write(f"namespace={namespace}\n")
+              output.write(f"builder={pin['image']}\n")
+              output.write(f"builder_revision={revision}\n")
+              output.write(f"builddate={builddate}\n")
+              revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+              output.write(f"revision={revision}\n")
+          PY
+
+      - name: Verify the reused builder has identical build inputs
+        env:
+          BUILDER_REVISION: ${{ steps.metadata.outputs.builder_revision }}
+        run: |
+          git fetch --depth=1 origin "${BUILDER_REVISION}"
+          git show "${BUILDER_REVISION}:extras/Dockerfile.builder" |
+            cmp - extras/Dockerfile.builder
+          git show "${BUILDER_REVISION}:requirements/builder-requirements.txt" |
+            cmp - requirements/builder-requirements.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/ci_merge-requirements.txt
+
+      - name: Build the operator's bundled CLI
+        env:
+          KADALU_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential libattr1-dev
+          python -m pip install --requirement requirements/ci_merge-requirements.txt
+          python -m pip install --no-deps --editable ./requirements
+          make cli-build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Verify builder provenance
+        env:
+          BUILDER: ${{ steps.metadata.outputs.builder }}
+          BUILDER_REVISION: ${{ steps.metadata.outputs.builder_revision }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: tests/ci/verify-image-provenance.sh "${BUILDER}" "${BUILDER_REVISION}" "${EXPECTED_SOURCE}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Preserve immutable operator versions
+        id: image
+        env:
+          REFERENCE: ghcr.io/${{ steps.metadata.outputs.namespace }}/kadalu-operator:${{ steps.metadata.outputs.version }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_REVISION: ${{ steps.metadata.outputs.revision }}
+        run: |
+          if result="$(docker buildx imagetools inspect "${REFERENCE}" 2>&1)"; then
+            tests/ci/verify-image-provenance.sh "${REFERENCE}" "${EXPECTED_REVISION}" "${EXPECTED_SOURCE}"
+            echo "missing=false" >>"${GITHUB_OUTPUT}"
+          else
+            case "${result}" in
+              *"manifest unknown"*|*"not found"*) ;;
+              *) echo "Registry lookup failed; refusing to replace an ambiguous tag" >&2; exit 1 ;;
+            esac
+            echo "missing=true" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build and publish the operator
+        if: steps.image.outputs.missing == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: kadalu_operator/Dockerfile
+          target: prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ steps.metadata.outputs.namespace }}/kadalu-operator:${{ steps.metadata.outputs.version }}
+          build-args: |
+            builder_image=${{ steps.metadata.outputs.builder }}
+            version=${{ steps.metadata.outputs.version }}
+            builddate=${{ steps.metadata.outputs.builddate }}
+            revision=${{ steps.metadata.outputs.revision }}
+            source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Verify published provenance and anonymous access
+        env:
+          EXPECTED_REVISION: ${{ steps.metadata.outputs.revision }}
+          REFERENCE: ghcr.io/${{ steps.metadata.outputs.namespace }}/kadalu-operator:${{ steps.metadata.outputs.version }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          tests/ci/verify-image-provenance.sh "${REFERENCE}" "${EXPECTED_REVISION}" "${EXPECTED_SOURCE}"
+          anonymous_config="$(mktemp -d)"
+          test -n "${anonymous_config}"
+          trap 'rm -r -- "${anonymous_config}"' EXIT
+          DOCKER_CONFIG="${anonymous_config}" docker manifest inspect "${REFERENCE}" >/dev/null
