@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-MODULE = Path(__file__).resolve().parents[2] / "kadalu_operator" / "heal.py"
+MODULE = Path(__file__).resolve().parents[2] / "lib" / "kadaluheal.py"
 SPEC = importlib.util.spec_from_file_location("storage_heal", MODULE)
 heal = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(heal)
@@ -140,7 +140,7 @@ class UpgradePreflightTests(unittest.TestCase):
     def setUp(self):
         # Load the production function in isolation so these tests need neither
         # the Kubernetes client nor the operator's unrelated startup dependencies.
-        path = MODULE.with_name("main.py")
+        path = MODULE.parents[1] / "kadalu_operator" / "main.py"
         tree = ast.parse(path.read_text())
         function = next(node for node in tree.body
                         if isinstance(node, ast.FunctionDef)
