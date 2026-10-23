@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import urllib3
 from jinja2 import Template
 
+import kadaluheal as heal
 from kadalulib import CommandException
 from kadalulib import execute as lib_execute
 from kadalulib import (is_host_reachable, logf, logging_setup,
@@ -25,8 +26,6 @@ from kubernetes import client, config, watch
 from urllib3.exceptions import NewConnectionError, ProtocolError
 from utils import CommandError
 from utils import execute as utils_execute
-
-from kadalu_operator import heal
 
 NAMESPACE = os.environ.get("KADALU_NAMESPACE", "kadalu")
 VERSION = os.environ.get("KADALU_VERSION", "latest")
