@@ -46,6 +46,16 @@ Exemple for a generic Kubernetes Cluster in single command ligne:
 
 (wait for operator and csi-provisionner pods in kadalu namespace get in Running state)
 
+For replicated and dispersed pools, the operator checks the complete pool's
+heal summary before applying storage resources during an upgrade. Every brick
+must be connected and all heal counters must be zero. A complete summary with
+pending work is polled every five seconds; other servers are queried only when
+the current query fails or returns an incomplete summary. If the pool does not
+become clean within fifteen minutes, the upgrade stops before applying that
+pool's storage resources. Investigate the reported heal state before retrying.
+
+This preflight does not replace sequential brick rollout or post-rollout checks.
+
 == Apply kadalu CSI-Nodeplugin
 
 1. Download the relevant Kadalu CSI-Nodeplugin file definition according to your Kubernetes Cluster:

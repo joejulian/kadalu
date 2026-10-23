@@ -3,6 +3,7 @@ KaDalu Operator: Once started, deploys required CSI drivers,
 bootstraps the ConfigMap and waits for the CRD update to create
 Server pods
 """
+from functools import partial
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ from kubernetes import client, config, watch
 from urllib3.exceptions import NewConnectionError, ProtocolError
 from utils import CommandError
 from utils import execute as utils_execute
+
+from kadalu_operator import heal
 
 NAMESPACE = os.environ.get("KADALU_NAMESPACE", "kadalu")
 VERSION = os.environ.get("KADALU_VERSION", "latest")
@@ -352,7 +355,17 @@ def upgrade_storage_pods(core_v1_client):
             obj["spec"]["storage"][idx]["device"] = val["brick_device"]
             obj["spec"]["storage"][idx]["pvc"] = val["pvc_name"]
 
-        # TODO: call upgrade_pods_with_heal_check() here
+        if data['type'] in (VOLUME_TYPE_REPLICA_2, VOLUME_TYPE_REPLICA_3,
+                            VOLUME_TYPE_ARBITER, VOLUME_TYPE_DISPERSE):
+            servers = [get_brick_hostname(volname, index, suffix=False) + "-0"
+                       for index in range(len(data["bricks"]))]
+            heal.wait_for_storage_heal(
+                volname, servers, query=partial(
+                    heal.query_summary, volname, namespace=NAMESPACE,
+                    kubectl_cmd=KUBECTL_CMD,
+                ),
+            )
+        # Sequential rollout and post-rollout heal checks remain separate work.
         deploy_server_pods(obj)
 
 
