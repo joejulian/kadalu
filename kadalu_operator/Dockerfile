@@ -41,6 +41,7 @@ COPY templates/storageclass-kadalu.custom.yaml.j2    /kadalu/templates/storagecl
 COPY templates/external-storageclass.yaml.j2         /kadalu/templates/external-storageclass.yaml.j2
 COPY lib/kadalulib.py                       /kadalu/kadalulib.py
 COPY cli/kubectl_kadalu/utils.py            /kadalu/utils.py
+COPY kadalu_operator/heal.py /kadalu/kadalu_operator/heal.py
 COPY kadalu_operator/main.py                       /kadalu/
 COPY kadalu_operator/start.py                      /kadalu/
 COPY kadalu_operator/metrics.py                    /kadalu/
