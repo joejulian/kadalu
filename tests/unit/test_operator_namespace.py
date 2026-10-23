@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_module(monkeypatch, module_name):
+    monkeypatch.syspath_prepend(str(ROOT / "lib"))
     monkeypatch.syspath_prepend(str(ROOT / "cli" / "kubectl_kadalu"))
     monkeypatch.syspath_prepend(str(ROOT / "kadalu_operator"))
     fake_kadalulib = types.ModuleType("kadalulib")
