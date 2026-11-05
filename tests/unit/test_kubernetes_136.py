@@ -38,7 +38,7 @@ SIDECAR_IMAGES = {
 
 
 def _render_csi_documents(
-        provisioner_replicas=None, nodeplugin_tolerations=None):
+        provisioner_replicas=None, nodeplugin_tolerations=None, resources=None):
     template = Template(
         (ROOT / "templates/csi.yaml.j2").read_text(encoding="utf-8")
     )
@@ -64,11 +64,13 @@ def _render_csi_documents(
     }
     if provisioner_replicas is not None:
         values["provisioner_replicas"] = provisioner_replicas
+    if resources is not None:
+        values["csi_resources"] = resources
     rendered = template.render(**values)
     return [document for document in yaml.safe_load_all(rendered) if document]
 
 
-def _render_server(tolerations):
+def _render_server(tolerations, resources=None):
     template = Template(
         (ROOT / "templates" / "server.yaml.j2").read_text(encoding="utf-8")
     )
@@ -82,6 +84,7 @@ def _render_server(tolerations):
         k8s_dist="kubernetes",
         verbose="no",
         tolerations=tolerations,
+        server_resources={} if resources is None else resources,
         kube_hostname="linus-caldwell",
         shd_required=False,
         brick_path="/bricks/bellagio-vault/data/brick",
@@ -704,3 +707,35 @@ def test_only_stable_csidriver_api_is_packaged():
     assert document["spec"]["podInfoOnMount"] is False
     assert document["spec"]["volumeLifecycleModes"] == ["Persistent"]
     assert "fsGroupPolicy" not in document["spec"]
+
+
+def test_server_budget_changes_only_resources_and_retains_storage_identity():
+    baseline = _render_server([])
+    budget = {"requests": {"cpu": "1", "memory": "256Mi"},
+              "limits": {"cpu": "1", "memory": "2Gi"}}
+    configured = _render_server([], budget)
+    container = configured["spec"]["template"]["spec"]["containers"][0]
+    assert container.pop("resources") == budget
+    assert configured == baseline
+
+
+def test_csi_budgets_preserve_ondelete_mounts_and_unconfigured_containers():
+    baseline = _render_csi_documents()
+    budget = {"requests": {"cpu": "10m", "memory": "32Mi"},
+              "limits": {"cpu": "1", "memory": "128Mi"}}
+    configured = _render_csi_documents(resources={
+        "kadalu-nodeplugin": budget, "csi-provisioner": budget,
+        "kadalu-logging": budget,
+    })
+    counts = {}
+    for document in configured:
+        if document["kind"] not in {"DaemonSet", "StatefulSet"}:
+            continue
+        if document["kind"] == "DaemonSet":
+            assert document["spec"]["updateStrategy"]["type"] == "OnDelete"
+        for container in document["spec"]["template"]["spec"]["containers"]:
+            if "resources" in container:
+                assert container.pop("resources") == budget
+                counts[container["name"]] = counts.get(container["name"], 0) + 1
+    assert counts == {"kadalu-nodeplugin": 1, "csi-provisioner": 1, "kadalu-logging": 2}
+    assert configured == baseline
