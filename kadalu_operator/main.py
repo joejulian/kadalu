@@ -13,6 +13,7 @@ import time
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import urllib3
 from jinja2 import Template
@@ -49,6 +50,8 @@ SERVER_CONFIG_MAP = os.environ.get(
     "KADALU_SERVER_CONFIG_MAP", "kadalu-server-config"
 )
 DEFAULT_COMPONENT_CONFIG = {
+    "csi_resources": {},
+    "server_resources": {},
     "csi_version": VERSION,
     "csi_image": f"{IMAGES_HUB}/{DOCKER_USER}/kadalu-csi:{VERSION}",
     "node_driver_registrar_image": (
@@ -82,6 +85,7 @@ DEFAULT_COMPONENT_CONFIG = {
 }
 COMPONENT_CONFIG = dict(DEFAULT_COMPONENT_CONFIG)
 CSI_CONFIG_FIELDS = {
+    "resources": "csi_resources",
     "version": "csi_version",
     "driverImage": "csi_image",
     "nodeDriverRegistrarImage": "node_driver_registrar_image",
@@ -94,6 +98,7 @@ CSI_CONFIG_FIELDS = {
     "verbose": "csi_verbose",
 }
 SERVER_CONFIG_FIELDS = {
+    "resources": "server_resources",
     "version": "server_version",
     "image": "server_image",
     "kubernetesDistro": "server_k8s_dist",
@@ -212,6 +217,70 @@ def clear_operator_ready():
         pass
 
 
+CSI_RESOURCE_CONTAINERS = {
+    "csi-node-driver-registrar", "kadalu-nodeplugin", "csi-liveness-probe",
+    "kadalu-logging", "kadalu-provisioner", "csi-provisioner", "csi-resizer",
+}
+
+
+def _resource_quantity(value, resource):
+    """Validate the CPU and byte quantity forms supported by resource config."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError("resource quantities must be strings or numbers")
+    match = re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)(m|Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?",
+        str(value),
+    )
+    if not match:
+        raise ValueError(f"invalid {resource} resource quantity")
+    suffix = match[2] or ""
+    if resource == "cpu" and suffix not in ("", "m"):
+        raise ValueError("CPU resource quantities require cores or millicores")
+    multipliers = {
+        "": 1, "m": Decimal("0.001"), "Ki": 2**10, "Mi": 2**20,
+        "Gi": 2**30, "Ti": 2**40, "Pi": 2**50, "Ei": 2**60,
+        "k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12,
+        "P": 10**15, "E": 10**18,
+    }
+    amount = Decimal(match[1]) * multipliers[suffix]
+    if amount <= 0:
+        raise ValueError("resource quantities must be positive")
+    return amount
+
+
+def _resource_requirements(value):
+    """Reject malformed budgets before changing any generated workload."""
+    if not isinstance(value, dict) or set(value) - {"requests", "limits"}:
+        raise ValueError("resources must contain only requests and limits")
+    result = {}
+    for kind, quantities in value.items():
+        if not isinstance(quantities, dict) or set(quantities) - {
+                "cpu", "memory", "ephemeral-storage"}:
+            raise ValueError("unsupported resource names or resource map")
+        result[kind] = {}
+        for resource, quantity in quantities.items():
+            _resource_quantity(quantity, resource)
+            result[kind][resource] = str(quantity)
+    for resource, request in result.get("requests", {}).items():
+        limit = result.get("limits", {}).get(resource)
+        if limit is not None and (
+                _resource_quantity(request, resource)
+                > _resource_quantity(limit, resource)):
+            raise ValueError(f"{resource} request exceeds its limit")
+    return result
+
+
+def _component_resource_configuration(value, field):
+    """Decode per-container CSI budgets or the common server budget."""
+    decoded = json.loads(value)
+    if field == "server_resources":
+        return _resource_requirements(decoded)
+    if not isinstance(decoded, dict) or set(decoded) - CSI_RESOURCE_CONTAINERS:
+        raise ValueError("unsupported CSI resource container names")
+    return {name: _resource_requirements(budget)
+            for name, budget in decoded.items()}
+
+
 def _read_optional_component_config(core_v1_client, name, fields):
     """Read and validate one optional Helm-owned component ConfigMap."""
     try:
@@ -237,7 +306,11 @@ def _read_optional_component_config(core_v1_client, name, fields):
             raise ValueError(
                 f"ConfigMap {name} data key {key} must be a non-empty string"
             )
-        values[fields[key]] = value
+        field = fields[key]
+        values[field] = (
+            _component_resource_configuration(value, field)
+            if key == "resources" else value
+        )
     return values
 
 
@@ -3305,6 +3378,7 @@ def deploy_server_pods(obj, apps_v1_client=None):
         "namespace": NAMESPACE,
         "kadalu_version": COMPONENT_CONFIG["server_version"],
         "server_image": COMPONENT_CONFIG["server_image"],
+        "server_resources": COMPONENT_CONFIG.get("server_resources", {}),
         "volname": volname,
         "voltype": voltype,
         "pvReclaimPolicy": pv_reclaim_policy,
@@ -4977,6 +5051,7 @@ def delete_server_pods(storage_info_data, obj):
         "namespace": NAMESPACE,
         "kadalu_version": COMPONENT_CONFIG["server_version"],
         "server_image": COMPONENT_CONFIG["server_image"],
+        "server_resources": COMPONENT_CONFIG.get("server_resources", {}),
         "volname": volname,
         "voltype": voltype,
         "volume_id": volumeid,
@@ -5739,7 +5814,8 @@ def deploy_csi_pods(
              k8s_dist=COMPONENT_CONFIG["csi_k8s_dist"],
              verbose=COMPONENT_CONFIG["csi_verbose"],
              provisioner_replicas=provisioner_replicas,
-             nodeplugin_tolerations=nodeplugin_tolerations)
+             nodeplugin_tolerations=nodeplugin_tolerations,
+             csi_resources=COMPONENT_CONFIG.get("csi_resources", {}))
 
     lib_execute(KUBECTL_CMD, APPLY_CMD, "-f", filename)
     logging.info(logf("Deployed CSI Pods", manifest=filename))

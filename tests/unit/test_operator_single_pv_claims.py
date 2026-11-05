@@ -10514,3 +10514,55 @@ def test_crd_watch_relists_after_expired_resource_version(monkeypatch):
         )
 
     assert calls == ["122", None]
+
+
+def test_component_resource_budgets_are_typed_and_fingerprinted(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    server = {"requests": {"cpu": 1, "memory": "256Mi"},
+              "limits": {"cpu": 1, "memory": "2Gi"}}
+    sidecars = {"csi-provisioner": {
+        "requests": {"cpu": "10m", "memory": "32Mi"},
+        "limits": {"cpu": "1", "memory": "128Mi"},
+    }}
+    maps = {
+        operator.SERVER_CONFIG_MAP: SimpleNamespace(data={"resources": json.dumps(server)}),
+        operator.CSI_CONFIG_MAP: SimpleNamespace(data={"resources": json.dumps(sidecars)}),
+    }
+    core = SimpleNamespace(read_namespaced_config_map=lambda name, _namespace: maps[name])
+    resolved, fingerprint = operator.read_component_configuration(core)
+    assert resolved["server_resources"]["requests"]["cpu"] == "1"
+    assert resolved["server_resources"]["limits"]["cpu"] == "1"
+    assert resolved["csi_resources"] == sidecars
+    assert json.loads(fingerprint)["server_resources"] == resolved["server_resources"]
+    maps[operator.SERVER_CONFIG_MAP].data = {"resources": "{}"}
+    _resolved, empty_fingerprint = operator.read_component_configuration(core)
+    assert fingerprint != empty_fingerprint
+
+
+@pytest.mark.parametrize("budget", [
+    [], {"request": {"cpu": "1"}}, {"requests": []},
+    {"requests": {"cpu": "-1"}}, {"requests": {"cpu": "0"}},
+    {"requests": {"memory": True}}, {"limits": {"memory": "not-memory"}},
+    {"requests": {"cpu": "2"}, "limits": {"cpu": "1"}},
+    {"requests": {"memory": "2Gi"}, "limits": {"memory": "1024Mi"}},
+])
+def test_invalid_component_resource_budget_leaves_active_configuration_unchanged(
+        monkeypatch, budget):
+    operator = _load_operator(monkeypatch)
+    before = deepcopy(operator.COMPONENT_CONFIG)
+    core = SimpleNamespace(read_namespaced_config_map=lambda name, _namespace: SimpleNamespace(
+        data={"resources": json.dumps(budget)} if name == operator.SERVER_CONFIG_MAP else {},
+    ))
+    with pytest.raises(ValueError):
+        operator.load_component_configuration(core)
+    assert operator.COMPONENT_CONFIG == before
+
+
+def test_csi_resource_container_typo_is_rejected(monkeypatch):
+    operator = _load_operator(monkeypatch)
+    core = SimpleNamespace(read_namespaced_config_map=lambda name, _namespace: SimpleNamespace(
+        data={"resources": json.dumps({"misspelled-sidecar": {}})}
+        if name == operator.CSI_CONFIG_MAP else {},
+    ))
+    with pytest.raises(ValueError, match="container names"):
+        operator.read_component_configuration(core)

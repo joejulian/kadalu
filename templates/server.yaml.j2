@@ -68,6 +68,9 @@ spec:
 
       containers:
         - name: server
+{% if server_resources | default({}) %}
+          resources: {{ server_resources | tojson }}
+{% endif %}
           image: {{ server_image | tojson }}
           readinessProbe:
             tcpSocket:
