@@ -64,6 +64,9 @@ spec:
 {% endif %}
       containers:
         - name: csi-node-driver-registrar
+{% if (csi_resources | default({})).get("csi-node-driver-registrar") %}
+          resources: {{ csi_resources["csi-node-driver-registrar"] | tojson }}
+{% endif %}
           image: {{ node_driver_registrar_image | tojson }}
           args:
             - "--v=5"
@@ -103,6 +106,9 @@ spec:
             - name: registration-dir
               mountPath: /registration
         - name: kadalu-nodeplugin
+{% if (csi_resources | default({})).get("kadalu-nodeplugin") %}
+          resources: {{ csi_resources["kadalu-nodeplugin"] | tojson }}
+{% endif %}
           securityContext:
             privileged: true
             capabilities:
@@ -142,6 +148,9 @@ spec:
               mountPath: {{ kubelet_dir }}/plugins/kubernetes.io/csi
               mountPropagation: "Bidirectional"
         - name: csi-liveness-probe
+{% if (csi_resources | default({})).get("csi-liveness-probe") %}
+          resources: {{ csi_resources["csi-liveness-probe"] | tojson }}
+{% endif %}
           image: {{ liveness_probe_image | tojson }}
           args:
             - "--csi-address=/plugin/csi.sock"
@@ -160,6 +169,9 @@ spec:
             - name: plugin-dir
               mountPath: /plugin
         - name: kadalu-logging
+{% if (csi_resources | default({})).get("kadalu-logging") %}
+          resources: {{ csi_resources["kadalu-logging"] | tojson }}
+{% endif %}
           image: {{ busybox_image | tojson }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
@@ -227,6 +239,9 @@ spec:
       serviceAccountName: kadalu-csi-provisioner
       containers:
         - name: csi-provisioner
+{% if (csi_resources | default({})).get("csi-provisioner") %}
+          resources: {{ csi_resources["csi-provisioner"] | tojson }}
+{% endif %}
           image: {{ provisioner_image | tojson }}
           args:
             - "--csi-address=$(ADDRESS)"
@@ -258,6 +273,9 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: kadalu-provisioner
+{% if (csi_resources | default({})).get("kadalu-provisioner") %}
+          resources: {{ csi_resources["kadalu-provisioner"] | tojson }}
+{% endif %}
           securityContext:
             privileged: true
             capabilities:
@@ -324,6 +342,9 @@ spec:
               readOnly: true
               mountPath: "/etc/secret-volume"
         - name: kadalu-logging
+{% if (csi_resources | default({})).get("kadalu-logging") %}
+          resources: {{ csi_resources["kadalu-logging"] | tojson }}
+{% endif %}
           image: {{ busybox_image | tojson }}
           imagePullPolicy: IfNotPresent
           command: ["/bin/sh"]
@@ -332,6 +353,9 @@ spec:
             - name: varlog
               mountPath: "/var/log/gluster"
         - name: csi-resizer
+{% if (csi_resources | default({})).get("csi-resizer") %}
+          resources: {{ csi_resources["csi-resizer"] | tojson }}
+{% endif %}
           image: {{ resizer_image | tojson }}
           args:
             - "--csi-address=$(ADDRESS)"
@@ -363,6 +387,9 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-liveness-probe
+{% if (csi_resources | default({})).get("csi-liveness-probe") %}
+          resources: {{ csi_resources["csi-liveness-probe"] | tojson }}
+{% endif %}
           image: {{ liveness_probe_image | tojson }}
           args:
             - "--csi-address=/plugin/csi.sock"

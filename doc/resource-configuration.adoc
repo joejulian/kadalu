@@ -1,0 +1,36 @@
+= Resource Configuration
+
+The operator accepts optional `resources` JSON in its independently managed
+component ConfigMaps. Resource fields are validated before the active
+configuration is replaced. Unsupported container names, malformed quantities,
+and requests larger than limits are rejected without changing workloads.
+
+`kadalu-server-config` accepts one Kubernetes ResourceRequirements object,
+applied to every generated server container. For example:
+
+[source,json]
+----
+{"requests":{"cpu":"1","memory":"256Mi"},"limits":{"cpu":"1","memory":"2Gi"}}
+----
+
+`kadalu-csi-config` accepts a map from container name to ResourceRequirements.
+Supported names are `kadalu-nodeplugin`, `kadalu-provisioner`,
+`csi-node-driver-registrar`, `csi-provisioner`, `csi-resizer`,
+`csi-liveness-probe`, and `kadalu-logging`. A container name shared by the node
+plugin and provisioner receives the same budget in both workloads. CPU, memory,
+and ephemeral-storage requests and limits are supported. Omitted budgets retain
+the previous unconfigured behavior; empty component defaults remain compatible.
+
+When using Helm-managed component ConfigMaps, set the component chart's
+`resources` value instead of editing a live ConfigMap. Deploy an operator with
+resource support before supplying nonempty values to those charts.
+
+Resource changes use the existing component configuration reconciliation path.
+Servers update serially with the existing heal checks. Node-plugin changes keep
+the OnDelete strategy and provisioning fence; evacuate or unpublish each node's
+volumes before explicitly advancing its client pod. Resource changes never
+bypass the mount-safety gates.
+
+Equal integer CPU requests and limits establish a reservation and quota. CPU
+exclusivity additionally depends on the node CPU Manager policy and qualifying
+pod QoS; these component settings do not change node CPU management.

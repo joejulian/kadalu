@@ -10,6 +10,7 @@
     - title: Try Kadalu
     - title: External Gluster Storage
     - title: Storage Config Options
+    - title: Resource Configuration
     - title: Block Volume
     - title: Storage Classes
     - title: Troubleshooting
